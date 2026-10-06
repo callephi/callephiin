@@ -9,7 +9,7 @@
 <h4 align="center">A Jellyfin desktop frontend for Windows built with Rust.</h4>
 
 #### ⚠️ Disclaimer
-This project is strictly personal and completely vibecode slop. The only human-made part of this project is the overall design as well as the logo. Updates will come likely rarely, and bugs may last forever. *However,* I do want this to be an overall good client (at least for the uses I have for it), so if you come across bugs, please, [submit an issue for it.] (https://github.com/callephi/callephiin/issues/new)
+This project is strictly personal and completely vibecode slop. The only human-made part of this project is the overall design as well as the logo. Updates will come likely rarely, and bugs may last forever. *However,* I do want this to be an overall good client (at least for the uses I have for it), so if you come across bugs, please, [submit an issue for it.](https://github.com/callephi/callephiin/issues/new)
 
 ## Key Features
 - MPV backend for video playback with cohesive handling of audio/subtitle tracks
