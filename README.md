@@ -28,8 +28,6 @@ Install [Rust's MSVC toolchain](https://rustup.rs), accepting the options as the
 
 Clone this repo using `git clone https://github.com/callephi/callephiin` to a directory of your choice.
 
-In another folder, extract any `mpv-dev-x86_64-*` archive from [SourceForge](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/) (latest preferred) to a folder close to your repo clone.
+In another folder, extract any `mpv-dev-x86_64-*` archive from [SourceForge](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/) (latest preferred) into the `mpv` folder of the repo.
 
-In the repo's `mpv` folder, edit `build-callephiin.bat` and change `cd C:\YOUR_DIRECTORY_HERE` to the folder where you cloned the repo.
-
-The compiled build will be in `/target/release`.
+Run `build-callephiin.bat` from the repo root, and the compiled build will be in `/target/release`.
