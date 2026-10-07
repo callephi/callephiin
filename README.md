@@ -17,12 +17,15 @@ This project is strictly personal and completely vibecode slop. The only human-m
 - IntroSkipper support
 - Multiple profiles & servers
 - Spoiler Protection option (disabled by default)
-- TrickPlay support
+- Custom interface sizing (automatic by default)
 - More to be worked on:
   - Nice animations
   - Better handling of missing metadata
   - More detailed Settings page
   - Improved compatibility for external/sidecar files
+  - TrickPlay support
+  - Support for Apple Silicon
+  - Some more fun stuff
 
 ## Download
 The latest builds for Windows can be found on the [Releases page](https://github.com/callephi/callephiin/releases). 
