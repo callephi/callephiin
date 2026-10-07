@@ -15,8 +15,14 @@ This project is strictly personal and completely vibecode slop. The only human-m
 - MPV backend for video playback with cohesive handling of audio/subtitle tracks
 - Discord Presence
 - IntroSkipper support
+- Multiple profiles & servers
+- Spoiler Protection option (disabled by default)
 - TrickPlay support
-- More to be worked on
+- More to be worked on:
+  - Nice animations
+  - Better handling of missing metadata
+  - More detailed Settings page
+  - Improved compatibility for external/sidecar files
 
 ## Download
 The latest builds for Windows can be found on the [Releases page](https://github.com/callephi/callephiin/releases). 
