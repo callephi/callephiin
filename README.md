@@ -1,6 +1,6 @@
 <h1 align="center">
   <br>
-    <a href="https://github.com/callephi/callephiin"><img src="https://raw.githubusercontent.com/callephi/callephiin/assets/logo.svg" alt="callephiin" width="200"></a>
+    <a href="https://github.com/callephi/callephiin"><img src="https://raw.githubusercontent.com/callephi/callephiin/8837b74e5baa76e8e76d3f84500b563a0ba9a57a/assets/logo.svg" alt="callephiin" width="200"></a>
   <br>
   callephiin
   <br>
