@@ -73,9 +73,12 @@ fn render_logo(px: u32) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_premultiplied([px as usize, px as usize], pm.data()))
 }
 
-pub fn nav_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool, height: f32, compact: bool) -> bool {
-    let height = if compact { 46.0 } else { height };
-    let (rect, resp) = ui.allocate_exact_size(vec2(if compact { 38.0 } else { 68.0 }, height), Sense::click());
+/// `t`: 0 = collapsed sidebar, 1 = expanded. Button height and icon position never change,
+/// so nothing moves vertically while the sidebar animates.
+pub fn nav_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool, height: f32, t: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(38.0 + 30.0 * t, height), Sense::click());
+    // icon sits centred in the button when collapsed and slides up as the label appears
+    let cy = |top_off: f32| rect.center().y + (rect.top() + top_off - rect.center().y) * t;
     if selected || resp.hovered() {
         let fill = if selected { ACCENT.gamma_multiply(0.28) } else { Color32::from_white_alpha(10) };
         ui.painter().rect_filled(rect, 14.0, fill);
@@ -86,12 +89,12 @@ pub fn nav_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool, he
     }
     let color = if selected { Color32::WHITE } else { MUTED };
     if icon == "search" {
-        let c = pos2(rect.center().x - 1.5, if compact { rect.center().y - 1.5 } else { rect.top() + 20.5 });
+        let c = pos2(rect.center().x - 1.5, cy(20.5) - 1.5 * (1.0 - t));
         let st = Stroke::new(2.2_f32, color);
         ui.painter().circle_stroke(c, 7.0, st);
         ui.painter().line_segment([c + vec2(5.0, 5.0), c + vec2(11.0, 11.0)], st);
     } else if icon == "home" {
-        let c = pos2(rect.center().x, if compact { rect.center().y } else { rect.top() + 22.0 });
+        let c = pos2(rect.center().x, cy(22.0));
         let st = Stroke::new(2.0_f32, color);
         let (l, r, top, bot) = (c.x - 9.0, c.x + 9.0, c.y - 10.0, c.y + 9.0);
         let wall = c.y - 1.0;
@@ -103,7 +106,7 @@ pub fn nav_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool, he
         ui.painter().rect_filled(Rect::from_center_size(pos2(c.x, bot - 3.5), vec2(4.0, 7.0)), 1.0, color);
     } else {
         ui.painter().text(
-            pos2(rect.center().x, if compact { rect.center().y } else { rect.top() + 22.0 }),
+            pos2(rect.center().x, cy(22.0)),
             Align2::CENTER_CENTER,
             icon,
             FontId::proportional(22.0),
@@ -111,13 +114,14 @@ pub fn nav_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool, he
         );
     }
     // Each line of the label is painted on its own so multi-line labels stay centred.
-    for (i, line) in label.lines().enumerate().filter(|_| !compact) {
+    let label_col = color.gamma_multiply(((t - 0.35) / 0.65).clamp(0.0, 1.0));
+    for (i, line) in label.lines().enumerate().filter(|_| t > 0.36) {
         ui.painter().text(
             pos2(rect.center().x, rect.top() + 44.0 + i as f32 * 13.0),
             Align2::CENTER_CENTER,
             line,
             FontId::proportional(11.5),
-            color,
+            label_col,
         );
     }
     if resp.hovered() {
@@ -337,7 +341,8 @@ pub enum SeekEvent {
 }
 
 /// Time bar with intro/credits ranges drawn on the track.
-pub fn seek_bar(ui: &mut egui::Ui, width: f32, value: f64, total: f64, marks: &[SeekMark]) -> SeekEvent {
+/// `hover` receives (time, x, bar top y, marker label) while the pointer is over or dragging the bar.
+pub fn seek_bar(ui: &mut egui::Ui, width: f32, value: f64, total: f64, marks: &[SeekMark], chapters: &[f64], hover: &mut Option<(f64, f32, f32, Option<&'static str>)>) -> SeekEvent {
     let total = total.max(1.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click_and_drag());
     let active = resp.hovered() || resp.dragged();
@@ -360,6 +365,10 @@ pub fn seek_bar(ui: &mut egui::Ui, width: f32, value: f64, total: f64, marks: &[
             );
         }
     }
+    for &c in chapters {
+        let x = x_of(c);
+        p.line_segment([pos2(x, tr.min.y - 1.5), pos2(x, tr.max.y + 1.5)], Stroke::new(1.5_f32, Color32::from_white_alpha(70)));
+    }
     p.circle_filled(pos2(px, rect.center().y), if active { 9.0 } else { 6.5 }, Color32::WHITE);
 
     let pointer_t = resp
@@ -367,13 +376,10 @@ pub fn seek_bar(ui: &mut egui::Ui, width: f32, value: f64, total: f64, marks: &[
         .or_else(|| resp.hover_pos())
         .map(|pos| (((pos.x - tr.left()) / tr.width()).clamp(0.0, 1.0) as f64) * total);
 
-    if resp.hovered() && !resp.dragged() {
-        if let Some(t) = pointer_t {
-            let text = match marks.iter().find(|m| t >= m.start && t <= m.end) {
-                Some(m) => format!("{}  ·  {}", fmt_time(t), m.label),
-                None => fmt_time(t),
-            };
-            resp.clone().on_hover_text_at_pointer(text);
+    if resp.hovered() || resp.dragged() {
+        if let (Some(t), Some(pos)) = (pointer_t, resp.interact_pointer_pos().or_else(|| resp.hover_pos())) {
+            let label = marks.iter().find(|m| t >= m.start && t <= m.end).map(|m| m.label);
+            *hover = Some((t, pos.x.clamp(tr.left(), tr.right()), rect.top(), label));
         }
     }
 
@@ -410,15 +416,17 @@ struct PosterMetrics {
     title_h: f32,
     title_font: FontId,
     sub_font: FontId,
+    role_h: f32,
 }
 
-fn poster_metrics(ui: &egui::Ui, s: f32) -> PosterMetrics {
+fn poster_metrics(ui: &egui::Ui, s: f32, with_role: bool) -> PosterMetrics {
     let title_font = FontId::proportional(14.0 * s);
     let sub_font = FontId::proportional(12.0 * s);
     let (pw, ph) = (150.0 * s, 225.0 * s);
     let title_h = row_height(ui, &title_font) * 2.0;
     let sub_h = row_height(ui, &sub_font);
-    PosterMetrics { pw, ph, total_h: ph + 8.0 * s + title_h + 3.0 * s + sub_h + 4.0 * s, title_h, title_font, sub_font }
+    let role_h = if with_role { 10.0 * s + row_height(ui, &sub_font) } else { 0.0 };
+    PosterMetrics { pw, ph, total_h: ph + 8.0 * s + title_h + 3.0 * s + sub_h + 4.0 * s + role_h, title_h, title_font, sub_font, role_h }
 }
 
 fn poster_card(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, m: &PosterMetrics, play: &mut Option<Item>, hover: &mut Option<Item>) {
@@ -449,6 +457,10 @@ fn poster_card(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, m: &Post
         }
     }
     paint_wrapped(ui, rect, pos2(rect.left() + 2.0, y), &sub, m.sub_font.clone(), MUTED, m.pw - 4.0, 1);
+    if let (Some(role), true) = (&item.role, m.role_h > 0.0) {
+        y += row_height(ui, &m.sub_font) + 10.0 * s;
+        paint_wrapped(ui, rect, pos2(rect.left() + 2.0, y), role, m.sub_font.clone(), Color32::from_gray(200), m.pw - 4.0, 1);
+    }
     if resp.clicked() {
         *play = Some(item.clone());
     }
@@ -464,7 +476,7 @@ pub fn poster_row(
     play: &mut Option<Item>,
     hover: &mut Option<Item>,
 ) {
-    let m = poster_metrics(ui, s);
+    let m = poster_metrics(ui, s, items.iter().any(|i| i.role.is_some()));
     hscroll(ui, id_salt, s, |ui| {
         ui.horizontal(|ui| {
             for item in items {
@@ -478,7 +490,7 @@ pub fn poster_row(
 
 /// Poster cards wrapped into a grid that fills the available width.
 pub fn poster_grid(ui: &mut egui::Ui, client: &Client, items: &[Item], s: f32, play: &mut Option<Item>) {
-    let m = poster_metrics(ui, s);
+    let m = poster_metrics(ui, s, items.iter().any(|i| i.role.is_some()));
     let mut ignore: Option<Item> = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(14.0 * s, 10.0 * s);
@@ -490,24 +502,36 @@ pub fn poster_grid(ui: &mut egui::Ui, client: &Client, items: &[Item], s: f32, p
 
 /// Library tiles ("My Media"): 16:9 artwork with the library name on it.
 pub fn library_row(ui: &mut egui::Ui, client: &Client, libs: &[Item], s: f32, open: &mut Option<Item>) {
-    let (w, h) = (280.0 * s, 280.0 * s * 9.0 / 16.0);
+    // whole physical pixels, so the image and the gradient end on exactly the same edge
+    let ppp = ui.ctx().pixels_per_point();
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let (w, h) = (snap(280.0 * s), snap(280.0 * s * 9.0 / 16.0));
     let r = 14.0 * s;
     hscroll(ui, "library_row", s, |ui| {
         ui.horizontal(|ui| {
             for lib in libs {
                 let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+                ui.painter().rect_filled(rect, r, PANEL);
                 if lib.image_tags.contains_key("Primary") {
-                    egui::Image::new(client.image_url_w(&lib.id, "Primary", (640.0 * s) as u32)).show_loading_spinner(false).rounding(r).paint_at(ui, rect);
-                } else {
-                    ui.painter().rect_filled(rect, r, PANEL);
+                    let img = egui::Image::new(client.image_url_w(&lib.id, "Primary", (640.0 * s) as u32)).show_loading_spinner(false);
+                    // crop to fill the whole tile (no clear strip at the bottom)
+                    let uv = match img.load_for_size(ui.ctx(), rect.size()) {
+                        Ok(egui::load::TexturePoll::Ready { texture }) if texture.size.x > 0.0 && texture.size.y > 0.0 => {
+                            let (ia, ra) = (texture.size.x / texture.size.y, rect.width() / rect.height());
+                            if ia > ra {
+                                let w = ra / ia;
+                                Rect::from_min_max(pos2((1.0 - w) / 2.0, 0.0), pos2((1.0 + w) / 2.0, 1.0))
+                            } else {
+                                let h = ia / ra;
+                                Rect::from_min_max(pos2(0.0, (1.0 - h) / 2.0), pos2(1.0, (1.0 + h) / 2.0))
+                            }
+                        }
+                        _ => Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    };
+                    img.uv(uv).rounding(r).paint_at(ui, rect);
                 }
-                // darken the lower part so the name stays readable on any artwork
-                vgradient(
-                    ui.painter(),
-                    Rect::from_min_max(pos2(rect.left(), rect.top() + h * 0.4), rect.right_bottom()),
-                    Color32::TRANSPARENT,
-                    Color32::from_black_alpha(200),
-                );
+                // darken the lower part so the name stays readable; follows the rounded bottom corners
+                rounded_bottom_gradient(ui.painter(), rect, r, h * 0.4, 200, 1.0 / ppp);
                 ui.painter().text(
                     pos2(rect.left() + 16.0 * s, rect.bottom() - 14.0 * s),
                     Align2::LEFT_BOTTOM,
@@ -867,8 +891,10 @@ pub fn hero(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, opts: &Hero
     y += sum_h + 16.0 * s;
 
     // play button: compact, and shows the resume point when there is one
-    let resume = item.resume_seconds();
+    let resume = opts.resume.unwrap_or_else(|| item.resume_seconds());
     let base = opts.play_label.clone().unwrap_or_else(|| "Play".to_string());
+    // in-progress media: "Resume S1:E10 from 10:01" (shows) / "Resume from 10:01" (films)
+    let base = if resume > 1.0 { base.replacen("Play", "Resume", 1) } else { base };
     let label = if resume > 1.0 { format!("▶  {base} from {}", fmt_time(resume)) } else { format!("▶  {base}") };
     let btn_rect = Rect::from_min_size(pos2(x, y), vec2(box_w, 42.0 * s));
     let mut bui = ui.new_child(UiBuilder::new().max_rect(btn_rect).layout(Layout::left_to_right(Align::Center)));
@@ -894,6 +920,52 @@ pub fn hero(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, opts: &Hero
         };
         act.toggle_watched = resp.on_hover_text(tip).clicked();
     }
+    if let Some(fav) = opts.favorite {
+        bui.add_space(4.0 * s);
+        let d = 40.0 * s;
+        let (r, resp) = bui.allocate_exact_size(vec2(d, d), Sense::click());
+        let c = r.center() + vec2(0.0, 1.0 * s);
+        // simple rounded heart (two lobes, one point) from cubic curves
+        let u = 0.026 * d;
+        let at = |x: f32, y: f32| pos2(c.x + (x - 12.0) * u, c.y + (y - 12.2) * u);
+        let mut pts: Vec<Pos2> = vec![at(12.0, 21.35), at(10.55, 20.03)];
+        let curves: [[(f32, f32); 4]; 5] = [
+            [(10.55, 20.03), (5.4, 15.36), (2.0, 12.28), (2.0, 8.5)],
+            [(2.0, 8.5), (2.0, 5.42), (4.42, 3.0), (7.5, 3.0)],
+            [(7.5, 3.0), (9.24, 3.0), (10.91, 3.81), (12.0, 5.09)],
+            [(12.0, 5.09), (13.09, 3.81), (14.76, 3.0), (16.5, 3.0)],
+            [(16.5, 3.0), (19.58, 3.0), (22.0, 5.42), (22.0, 8.5)],
+        ];
+        let mut all = curves.to_vec();
+        all.push([(22.0, 8.5), (22.0, 12.28), (18.6, 15.36), (13.45, 20.04)]);
+        for cv in all {
+            for i in 1..=12 {
+                let t = i as f32 / 12.0;
+                let m = 1.0 - t;
+                let x = m * m * m * cv[0].0 + 3.0 * m * m * t * cv[1].0 + 3.0 * m * t * t * cv[2].0 + t * t * t * cv[3].0;
+                let y = m * m * m * cv[0].1 + 3.0 * m * m * t * cv[1].1 + 3.0 * m * t * t * cv[2].1 + t * t * t * cv[3].1;
+                pts.push(at(x, y));
+            }
+        }
+        pts.push(at(12.0, 21.35));
+        let col = if fav { Color32::from_rgb(0xff, 0x4d, 0x6a) } else if resp.hovered() { Color32::WHITE } else { Color32::from_gray(225) };
+        if fav {
+            let mut m = egui::Mesh::default();
+            m.colored_vertex(at(12.0, 11.0), col);
+            for p in &pts {
+                m.colored_vertex(*p, col);
+            }
+            for i in 1..pts.len() as u32 {
+                m.add_triangle(0, i, i + 1);
+            }
+            bui.painter().add(Shape::mesh(m));
+        }
+        bui.painter().add(Shape::line(pts, Stroke::new(2.4_f32, col)));
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        act.toggle_favorite = resp.on_hover_text(if fav { "Remove from favorites" } else { "Add to favorites" }).clicked();
+    }
     act
 }
 
@@ -917,6 +989,28 @@ pub fn vgradient(p: &egui::Painter, r: Rect, top: Color32, bottom: Color32) {
     m.colored_vertex(r.left_bottom(), bottom);
     m.add_triangle(0, 1, 2);
     m.add_triangle(0, 2, 3);
+    p.add(egui::Shape::mesh(m));
+}
+
+/// Transparent-to-black gradient over the lower part of `rect`, inset to follow its rounded bottom corners.
+pub fn rounded_bottom_gradient(p: &egui::Painter, rect: Rect, r: f32, height: f32, max_alpha: u8, overshoot: f32) {
+    const N: usize = 40;
+    let (y0, y1) = (rect.bottom() - height, rect.bottom() + overshoot);
+    let mut m = egui::Mesh::default();
+    for k in 0..=N {
+        let f = k as f32 / N as f32;
+        let y = y0 + (y1 - y0) * f;
+        let d = (y - (rect.bottom() - r)).clamp(0.0, r);
+        let inset = r - (r * r - d * d).max(0.0).sqrt();
+        let c = Color32::from_black_alpha((max_alpha as f32 * f) as u8);
+        m.colored_vertex(pos2(rect.left() + inset, y), c);
+        m.colored_vertex(pos2(rect.right() - inset, y), c);
+        if k > 0 {
+            let b = (k * 2) as u32;
+            m.add_triangle(b - 2, b - 1, b);
+            m.add_triangle(b - 1, b + 1, b);
+        }
+    }
     p.add(egui::Shape::mesh(m));
 }
 
@@ -1034,6 +1128,10 @@ pub fn tile_row(
             for item in items {
                 let (rect, resp) = ui.allocate_exact_size(vec2(w, total_h), Sense::click());
                 let thumb = Rect::from_min_size(rect.min, vec2(w, h));
+                if mode == TileMode::Episode && ui.data(|d| d.get_temp::<String>(egui::Id::new("scroll_to_ep"))).as_deref() == Some(item.id.as_str()) {
+                    ui.data_mut(|d| d.remove::<String>(egui::Id::new("scroll_to_ep")));
+                    ui.scroll_to_rect(rect, Some(Align::Min));
+                }
                 ui.painter().rect_filled(thumb, r, PANEL);
                 // spoiler control: unwatched episodes get a heavily down-scaled (= blurred) thumbnail
                 let hide = spoil.on && mode == TileMode::Episode && !item.played();
@@ -1108,6 +1206,9 @@ pub fn tile_row(
                     item.runtime_minutes().filter(|m| *m > 0).map(|m| format!("{m}m")).unwrap_or_default()
                 };
                 if mode == TileMode::Episode {
+                    if let Some(r) = item.community_rating.filter(|r| *r > 0.0) {
+                        third = if third.is_empty() { format!("★ {r:.1}") } else { format!("{third}  ·  ★ {r:.1}") };
+                    }
                     if let Some(d) = item.premiere_date.as_deref().and_then(fmt_date) {
                         third = if third.is_empty() { d } else { format!("{third}  ·  {d}") };
                     }
@@ -1270,7 +1371,19 @@ pub fn dropdown_button(ui: &mut egui::Ui, text: &str, size: f32) -> egui::Respon
 /// Horizontal row that also scrolls with the mouse wheel (vertical wheel = sideways) while the
 /// pointer is over it. At either end the wheel falls through to scroll the page again.
 pub fn hscroll(ui: &mut egui::Ui, id_salt: &str, s: f32, add: impl FnOnce(&mut egui::Ui)) {
-    let out = egui::ScrollArea::horizontal().id_salt(id_salt).show(ui, |ui| add(ui));
+    // eased scroll toward a nudge target: (start, target, start time)
+    let anim_id = egui::Id::new((id_salt, "nudge_anim"));
+    let mut area = egui::ScrollArea::horizontal().id_salt(id_salt);
+    if let Some((from, to, t0)) = ui.data(|d| d.get_temp::<(f32, f32, f64)>(anim_id)) {
+        let p = (((ui.input(|i| i.time) - t0) / 0.35) as f32).clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - p).powi(3);
+        area = area.horizontal_scroll_offset(from + (to - from) * e);
+        if p >= 1.0 {
+            ui.data_mut(|d| d.remove::<(f32, f32, f64)>(anim_id));
+        }
+        ui.ctx().request_repaint();
+    }
+    let out = area.show(ui, |ui| add(ui));
     let max = (out.content_size.x - out.inner_rect.width()).max(0.0);
     if max <= 1.0 {
         return;
@@ -1297,9 +1410,10 @@ pub fn hscroll(ui: &mut egui::Ui, id_salt: &str, s: f32, add: impl FnOnce(&mut e
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         if resp.clicked() {
-            let mut st = out.state;
-            st.offset.x = (off + dir * view.width() * 0.8).clamp(0.0, max);
-            st.store(ui.ctx(), out.id);
+            let from = ui.data(|d| d.get_temp::<(f32, f32, f64)>(anim_id)).map_or(off, |a| a.1);
+            let to = (from + dir * view.width() * 0.8).clamp(0.0, max);
+            let now = ui.input(|i| i.time);
+            ui.data_mut(|d| d.insert_temp(anim_id, (off, to, now)));
             ui.ctx().request_repaint();
         }
     }
@@ -1388,9 +1502,13 @@ pub struct Spoiler {
 pub struct HeroOpts {
     /// Replaces "Play" (e.g. "Play S1:E1").
     pub play_label: Option<String>,
+    /// Resume point of the item Play will start, when it differs from the shown item (shows).
+    pub resume: Option<f64>,
     /// Show the watched-toggle check next to Play.
     pub watch_button: bool,
     pub played: bool,
+    /// Show a favourite heart (value = currently favourite).
+    pub favorite: Option<bool>,
     /// Blur the episode thumbnail (spoiler control).
     pub blur_thumb: bool,
     /// Clicking the logo / title opens the show or movie page.
@@ -1401,5 +1519,6 @@ pub struct HeroOpts {
 pub struct HeroAction {
     pub play: bool,
     pub toggle_watched: bool,
+    pub toggle_favorite: bool,
     pub open_title: bool,
 }

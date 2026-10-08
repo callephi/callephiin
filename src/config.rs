@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// How the client decides between Direct Play and transcoding.
+/// Decides between Direct Play and transcoding
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamMode {
-    /// Direct Play on local/private networks, transcode (bitrate-capped) otherwise.
+    /// Direct Play on local/private networks, transcode (bitrate-capped) otherwise
     Auto,
     AlwaysDirect,
     AlwaysTranscode,
@@ -19,7 +19,7 @@ impl Default for StreamMode {
     }
 }
 
-/// A track described by its names (not its index, which differs between files).
+/// A track described by its names (not its index, which differs between files)
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StoredTrack {
     pub lang: String,
@@ -28,21 +28,21 @@ pub struct StoredTrack {
     pub forced: bool,
 }
 
-/// The audio/subtitle choice the user made for one show.
+/// The audio/subtitle choice the user made for one show
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SeriesTracks {
     pub audio: Option<StoredTrack>,
     pub sub: Option<StoredTrack>,
-    /// The user turned subtitles off.
+    /// The user turned subtitles off
     pub sub_off: bool,
 }
 
-/// A saved sign-in: server + user (the access token is stored, never the password).
+/// A saved sign-in: server + user (the access token is stored, never the password)
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
     pub id: String,
-    /// Optional custom display name.
+    /// Optional custom display name
     pub name: String,
     pub server_url: String,
     pub username: String,
@@ -69,15 +69,15 @@ pub struct Config {
     pub device_id: String,
 
     pub stream_mode: StreamMode,
-    /// Remote streaming cap in kbit/s (used when transcoding).
+    /// Remote streaming cap in kbit/s (used when transcoding)
     pub remote_bitrate_kbps: u32,
 
     pub discord_enabled: bool,
 
-    /// Start every file with its own default / forced audio and subtitle tracks.
-    /// When off, `preferred_*_lang` below decide instead.
+    /// Start every file with its own default / forced audio and subtitle tracks
+    /// When off, `preferred_*_lang` below decide instead
     pub use_file_default_tracks: bool,
-    /// Keep the audio/subtitle choice made for a show for the rest of that show.
+    /// Keep the audio/subtitle choice made for a show for the rest of that show
     pub remember_tracks: bool,
     /// series id -> remembered tracks
     pub series_tracks: HashMap<String, SeriesTracks>,
@@ -85,21 +85,24 @@ pub struct Config {
     pub preferred_audio_lang: String,
     pub sub_font_size: u32,
     pub volume: f64,
-    /// Content (home/settings) scale. 0.0 = automatic from monitor size.
+    /// Content (home/settings) scale. 0.0 = automatic from monitor size
     pub ui_scale: f32,
-    /// The user picked "Custom" in the scale list (so a custom value equal to a preset stays custom).
+    /// The user picked "Custom" in the scale list (so a custom value equal to a preset stays custom)
     pub ui_scale_custom: bool,
-    /// Load external (sidecar) subtitle files the server lists for a title.
+    /// Load external (sidecar) subtitle files the server lists for a title. Why doesn't this work
     pub external_tracks: bool,
-    /// Seconds jumped by the back / forward buttons and arrow keys.
+    /// Seconds jumped by the back/forward buttons or arrow keys
     pub skip_back_secs: u32,
     pub skip_fwd_secs: u32,
-    /// Hide titles, thumbnails and synopses of unwatched episodes.
+    /// Items per page when browsing a library
+    #[serde(default = "default_page_size")]
+    pub library_page_size: usize,
+    /// Hide titles, thumbnails and synopses of unwatched episodes
     pub spoiler_control: bool,
     pub profiles: Vec<Profile>,
-    /// Id of the profile that is signed in / was used last.
+    /// ID of the profile that is signed in or used last
     pub last_profile: String,
-    /// Show the profile switcher on every launch instead of signing straight in.
+    /// Toggle for showing profile switcher on launch
     pub switcher_on_launch: bool,
 }
 
@@ -126,6 +129,7 @@ impl Default for Config {
             external_tracks: true,
             skip_back_secs: 10,
             skip_fwd_secs: 30,
+            library_page_size: default_page_size(),
             spoiler_control: false,
             profiles: Vec::new(),
             last_profile: String::new(),
@@ -150,7 +154,10 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Configs from before profiles existed: turn the signed-in account into the first profile.
+    /// Configs from before profiles existed: turns the signed-in account into the first profile.
+	/// This probably ain't needed. The damn thing was private before v1.0.0, but in case someone
+	/// decides they should use the pre-release that IS publically available, well...
+	/// That's your own fault, man.
     fn migrate_profiles(&mut self) {
         if self.profiles.is_empty() && self.logged_in() {
             self.upsert_profile("");
@@ -162,7 +169,7 @@ impl Config {
     }
 
     /// Save the currently signed-in account as a profile (updating the one for the same
-    /// server + user) and make it the last used one.
+    /// server + user) and make it the last used one
     pub fn upsert_profile(&mut self, name: &str) {
         let norm = |u: &str| u.trim().trim_end_matches('/').to_lowercase();
         let existing = self
@@ -187,7 +194,7 @@ impl Config {
         self.last_profile = p.id.clone();
     }
 
-    /// Make a saved profile the signed-in account.
+    /// Make a saved profile the signed-in account
     pub fn activate(&mut self, id: &str) -> bool {
         let Some(p) = self.profile(id).cloned() else { return false };
         self.server_url = p.server_url;
@@ -198,7 +205,7 @@ impl Config {
         true
     }
 
-    /// Forget the access token of the active account (profile stays, sign in needed again).
+    /// Forget the access token of the active account (profile stays, sign in needed again)
     pub fn sign_out(&mut self) {
         let id = self.last_profile.clone();
         if let Some(p) = self.profiles.iter_mut().find(|p| p.id == id) {
@@ -222,4 +229,8 @@ impl Config {
     pub fn logged_in(&self) -> bool {
         !self.access_token.is_empty() && !self.server_url.is_empty()
     }
+}
+
+fn default_page_size() -> usize {
+    25
 }

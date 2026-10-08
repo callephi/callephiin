@@ -1,4 +1,4 @@
-//! Search tab, movie / show pages and person pages.
+//! Search tab, media pages and person pages.
 
 use super::{App, Msg, Tab};
 use crate::jellyfin::{Item, Person, SearchResults, TitleData};
@@ -6,11 +6,11 @@ use crate::ui::{self, TileMode, MUTED};
 use eframe::egui::{self, vec2, Color32, RichText};
 use std::time::{Duration, Instant};
 
-/// Which list the show page's main row shows.
+/// Decides what list is show in the main row
 #[derive(Clone, PartialEq)]
 pub(super) enum Sel {
     Season(String),
-    /// Series-level extras (only offered when there are several seasons).
+    /// Series-level extras when more than one season
     Extras,
 }
 
@@ -24,12 +24,14 @@ pub(super) struct TitleView {
     pub loading: bool,
     pub ep_loading: bool,
     pub error: Option<String>,
-    /// Episode last hovered: its summary is shown in the hero.
+    /// Episode last hovered: its summary is shown in the hero
     pub hero_ep: Option<Item>,
     pub similar: Vec<Item>,
     pub next_ep: Option<Item>,
-    /// Season list open (same style as the player's episode panel).
+    /// Season list open
     pub menu: bool,
+    /// Episode ID the row should be lined up with once it is drawn
+    pub focus: Option<String>,
     pub req: u64,
 }
 
@@ -53,7 +55,7 @@ pub(super) struct SearchState {
     pub loading: bool,
     pub req: u64,
     pub focus: bool,
-    /// The query `results` belong to.
+    /// The query `results` belongs to
     pub done_for: String,
 }
 
@@ -86,6 +88,7 @@ impl App {
             similar: vec![],
             next_ep: None,
             menu: false,
+            focus: None,
             req,
         }));
         self.scroll_reset = true;
@@ -125,11 +128,11 @@ impl App {
         v.ep_loading = true;
         v.episodes.clear();
         v.season_extras.clear();
-        let (req, series_id) = (v.req, v.item.id.clone());
+        let (req, series_id, has_logo) = (v.req, v.item.id.clone(), v.item.image_tags.contains_key("Logo"));
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let episodes = client.season_episodes(&series_id, &season_id);
-            let extras = client.extras(&season_id);
+            let extras = client.extras(&season_id, &series_id, has_logo);
             let _ = tx.send(Msg::TitleSeason { req, season_id, episodes, extras });
             ctx.request_repaint();
         });
@@ -151,6 +154,7 @@ impl App {
                         v.episodes = t.episodes.clone();
                         v.series_extras = t.series_extras.clone();
                         v.season_extras = t.season_extras.clone();
+                        v.focus = t.focus.clone();
                         if let Some(id) = &t.season_id {
                             v.sel = Sel::Season(id.clone());
                         }
@@ -191,7 +195,19 @@ impl App {
         }
     }
 
-    /// Mark the open movie / show / episode watched or unwatched (a whole series at once).
+    /// Mark the open media watched or unwatched (a whole series at once)
+    fn toggle_favorite(&mut self, ctx: &egui::Context) {
+        let Some(client) = self.client.clone() else { return };
+        let Some(Detail::Title(v)) = self.detail.last_mut() else { return };
+        let ud = v.item.user_data.get_or_insert_with(Default::default);
+        ud.is_favorite = !ud.is_favorite;
+        let (id, fav, ctx) = (v.item.id.clone(), ud.is_favorite, ctx.clone());
+        std::thread::spawn(move || {
+            let _ = client.set_favorite(&id, fav);
+            ctx.request_repaint();
+        });
+    }
+
     fn toggle_watched(&mut self, ctx: &egui::Context) {
         let Some(Detail::Title(v)) = self.detail.last() else { return };
         let target = v.item.clone();
@@ -256,6 +272,8 @@ impl App {
         let (episodes, series_extras, season_extras) = (v.episodes.clone(), v.series_extras.clone(), v.season_extras.clone());
         let (loading, ep_loading, error, hero_ep) = (v.loading, v.ep_loading, v.error.clone(), v.hero_ep.clone());
         let (similar, menu) = (v.similar.clone(), v.menu);
+        let focus = v.focus.clone();
+        let mut focus_used = false;
         let mut toggle_menu = false;
         let mut close_menu = false;
         let is_series = item.kind == "Series";
@@ -274,6 +292,7 @@ impl App {
         let mut hover: Option<Item> = None;
         let mut hero_play = false;
         let mut hero_toggle = false;
+        let mut hero_fav = false;
         let mut watched_ep: Option<Item> = None;
         let next_ep = match self.detail.last() {
             Some(Detail::Title(v)) => v.next_ep.clone(),
@@ -293,9 +312,11 @@ impl App {
             ui.add_space(8.0 * s);
 
             let mut hero_item = item.clone();
-            let mut opts = ui::HeroOpts { watch_button: true, played: item.played(), link_title: item.kind == "Episode", ..Default::default() };
+            let mut opts = ui::HeroOpts { watch_button: true, played: item.played(), favorite: Some(item.user_data.as_ref().map_or(false, |u| u.is_favorite)), link_title: item.kind == "Episode", ..Default::default() };
             if is_series {
                 opts.play_label = next_ep.as_ref().and_then(|e| e.ep_code()).map(|c| format!("Play {c}"));
+                // an episode in progress turns the button into "Resume S1:E10 from 10:01"
+                opts.resume = next_ep.as_ref().map(|e| e.resume_seconds());
             }
             if let Some(ep) = &hero_ep {
                 let hide = spoil.on && !ep.played();
@@ -320,6 +341,7 @@ impl App {
             let act = ui::hero(ui, &client, &hero_item, s, &opts);
             hero_play = act.play;
             hero_toggle = act.toggle_watched;
+            hero_fav = act.toggle_favorite;
             if act.open_title {
                 open = Some(item.series_stub());
             }
@@ -397,13 +419,23 @@ impl App {
                 }
                 ui.add_space(8.0 * s);
 
-                if sel == Sel::Extras {
+                if cats == 0 {
+                    if loading {
+                        ui.spinner();
+                    } else {
+                        ui.label(RichText::new("No episodes are currently available.").color(MUTED));
+                    }
+                } else if sel == Sel::Extras {
                     ui::tile_row(ui, &client, &series_extras, s, "title_extras_main", TileMode::Extra, &mut play, &mut hover, &mut open, &mut watched_ep, &spoil);
                 } else if loading || ep_loading {
                     ui.spinner();
                 } else if episodes.is_empty() {
-                    ui.label(RichText::new("No episodes.").color(MUTED));
+                    ui.label(RichText::new("No episodes are currently available.").color(MUTED));
                 } else {
+                    if let Some(f) = focus.as_ref().filter(|f| episodes.iter().any(|e| &e.id == *f)) {
+                        ui.data_mut(|d| d.insert_temp(egui::Id::new("scroll_to_ep"), f.clone()));
+                        focus_used = true;
+                    }
                     ui::tile_row(ui, &client, &episodes, s, &format!("title_eps_{cur_name}"), TileMode::Episode, &mut play, &mut hover, &mut open, &mut watched_ep, &spoil);
                 }
                 ui.add_space(14.0 * s);
@@ -519,6 +551,14 @@ impl App {
         }
         if let Some(ep) = watched_ep {
             self.toggle_item_watched(ep, ctx);
+        }
+        if focus_used {
+            if let Some(Detail::Title(v)) = self.detail.last_mut() {
+                v.focus = None;
+            }
+        }
+        if hero_fav {
+            self.toggle_favorite(ctx);
         }
         if hero_toggle {
             self.toggle_watched(ctx);
@@ -674,7 +714,7 @@ impl App {
     }
 }
 
-/// "Director: A, B" style rows from the credits plus studios and production locations.
+/// "Director: A, B" style rows from the credits plus studios and production locations
 fn staff_lines(item: &Item) -> Vec<(String, String)> {
     const ORDER: [&str; 8] = ["Director", "Writer", "Producer", "Creator", "Composer", "Editor", "Conductor", "Lyricist"];
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();

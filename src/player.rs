@@ -19,7 +19,7 @@ pub struct Player {
     pub current: Option<PlayInfo>,
 }
 
-/// Borrowed GL loader handed to mpv while the render context is created.
+/// Borrowed GL loader handed to mpv while the render context is created
 struct Loader<'a>(&'a dyn Fn(&CStr) -> *const c_void);
 
 fn get_proc_address(loader: &Loader<'_>, name: &str) -> *mut c_void {
@@ -105,7 +105,7 @@ impl Player {
     }
 
     /// How mpv picks the starting audio/subtitle tracks for the next file.
-    /// `use_file_defaults`: honour the file's own default / forced flags (no language override).
+    /// `use_file_defaults`: honour the file's own default / forced flags (no language override)
     pub fn apply_track_prefs(&self, use_file_defaults: bool, sub_langs: &str, audio_langs: &str) {
         if use_file_defaults {
             let _ = self.mpv.set_property("alang", "");
@@ -133,7 +133,9 @@ impl Player {
         self.mpv
             .command("loadfile", &[info.url.as_str(), "replace"])
             .map_err(|e| anyhow!("loadfile failed: {e:?}"))?;
-        let _ = self.mpv.set_property("pause", false);
+        // Start paused: the app applies remembered tracks first, then un-pauses, so the
+        // audio / subtitle reinit happens before the picture starts moving.
+        let _ = self.mpv.set_property("pause", true);
         for (url, title, lang) in &info.external_subs {
             let _ = self
                 .mpv
@@ -179,7 +181,7 @@ impl Player {
     pub fn set_volume(&self, v: f64) {
         let _ = self.mpv.set_property("volume", v);
     }
-    /// Audio or subtitle tracks in the currently loaded file.
+    /// Audio or subtitle tracks in the currently loaded file
     pub fn tracks(&self, kind: TrackKind) -> Vec<Track> {
         let want = match kind {
             TrackKind::Audio => "audio",
@@ -207,7 +209,7 @@ impl Player {
     pub fn set_audio(&self, id: i64) {
         let _ = self.mpv.set_property("aid", id);
     }
-    /// `None` turns subtitles off.
+    /// `None` turns subtitles off, obviously
     pub fn set_sub(&self, id: Option<i64>) {
         match id {
             Some(id) => {

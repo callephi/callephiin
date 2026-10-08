@@ -4,15 +4,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// callephiin's Discord application ID.
+/// callephiin's Discord application ID
+/// Please don't do bad things with this. Not that there is much to be done.
 const APP_ID: &str = "1556464248538800128";
 
-/// Snapshot of what is playing; the UI thread keeps this up to date.
+/// Snapshot of what is playing; the UI thread keeps this up to date
 #[derive(Clone, Debug, PartialEq)]
 pub struct NowPlaying {
     /// Show or movie title.
     pub title: String,
-    /// "S1:E3 · Episode Title" for episodes, empty for movies.
+    /// "S1:E3 · Episode Title" for episodes, empty for movies
     pub detail: String,
     pub position: f64,
     pub paused: bool,
@@ -33,7 +34,7 @@ fn fmt_time(secs: f64) -> String {
 }
 
 /// Background thread that pushes Rich Presence: immediately when the title or
-/// pause state changes, and otherwise every 30 seconds.
+/// pause state changes, and otherwise every 30s
 pub fn spawn(enabled: Arc<AtomicBool>, shared: Shared) {
     thread::spawn(move || {
         let mut client: Option<DiscordIpcClient> = None;

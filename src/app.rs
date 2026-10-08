@@ -4,10 +4,11 @@ use profiles::View;
 use pages::{Detail, SearchState};
 use crate::config::{Config, SeriesTracks, StoredTrack, StreamMode};
 use crate::discord::{self, NowPlaying};
-use crate::jellyfin::{Client, Item, SearchResults, TitleData, PlayInfo, Segment, SegmentKind, SortKey, PAGE_SIZES};
+use crate::jellyfin::{Client, Item, SearchResults, TitleData, PlayInfo, Segment, SegmentKind, SortKey, Trick, PAGE_SIZES};
 use crate::player::{Player, Track, TrackKind};
 use crate::ui::{self, Icon, SeekEvent, SeekMark, ACCENT, BG, MUTED, PANEL};
 use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, Rect, RichText, Rounding, Sense, UiBuilder};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -20,7 +21,7 @@ enum Tab {
     Settings,
 }
 
-/// What the "skip" button currently does.
+/// Skip the bitch
 #[derive(Clone, Copy)]
 enum Skip {
     Intro(f64),
@@ -29,8 +30,8 @@ enum Skip {
 
 enum Msg {
     Login(Result<Config, String>),
-    Home { latest: Vec<Item>, resume: Vec<Item>, next_up: Vec<Item>, libraries: Vec<Item>, admin: bool, version: String },
-    /// One page of a library (`req` identifies the request so stale answers are dropped).
+    Home { suggested: Vec<Item>, latest: Vec<Item>, resume: Vec<Item>, next_up: Vec<Item>, libraries: Vec<Item>, admin: bool, version: String },
+    /// One page of a library (`req` identifies the request so stale answers are dropped)
     Library { req: u64, result: Result<(Vec<Item>, usize), String> },
     Title { req: u64, result: Result<TitleData, String> },
     TitleSeason { req: u64, season_id: String, episodes: Vec<Item>, extras: Vec<Item> },
@@ -39,13 +40,15 @@ enum Msg {
     Search { req: u64, query: String, results: SearchResults },
     Error(String),
     Play(Result<PlayInfo, String>),
-    /// Intro/outro ranges and the following episode for the item that just started.
-    Meta { item_id: String, segments: Vec<Segment>, prev: Option<Item>, next: Option<Item> },
-    /// Episodes of one season for the player's episode panel (`seasons` is empty when unchanged).
+    /// Intro/outro ranges and the following episode for the item that just started
+    Meta { item_id: String, segments: Vec<Segment>, prev: Option<Item>, next: Option<Item>, trick: Option<Trick>, chapters: Vec<(String, f64)> },
+    /// One decoded trickplay sheet
+    Tile { item_id: String, index: u32, image: Option<egui::ColorImage> },
+    /// Episodes of one season for the player's episode panel (`seasons` is empty when unchanged)
     Episodes { series_id: String, seasons: Vec<Item>, season_id: String, episodes: Vec<Item> },
 }
 
-/// The library page the user opened from the home screen.
+/// The library page opened from Home
 struct LibraryView {
     lib: Item,
     key: SortKey,
@@ -58,7 +61,7 @@ struct LibraryView {
     error: Option<String>,
 }
 
-/// Things the player overlay asked for during one frame, applied after drawing.
+/// Things the player overlay asked for during one frame, applied after drawing
 #[derive(Default)]
 struct PlayerActions {
     back: bool,
@@ -81,6 +84,7 @@ pub struct App {
     server_version: String,
 
     latest: Vec<Item>,
+    suggested: Vec<Item>,
     resume: Vec<Item>,
     next_up: Vec<Item>,
     libraries: Vec<Item>,
@@ -120,10 +124,18 @@ pub struct App {
     audio_tracks: Vec<Track>,
     sub_tracks: Vec<Track>,
     tracks_at: Instant,
+    trick: Option<Trick>,
+    trick_tiles: HashMap<u32, egui::TextureHandle>,
+    trick_pending: HashSet<u32>,
     nav_w: f32,
     scroll_seen: Instant,
     vol_hot: bool,
     tracks_applied: bool,
+    meta_ready: bool,
+    started: bool,
+    /// Pause requested while the black pre-roll frame is still showing
+    user_hold: bool,
+    chapters: Vec<(String, f64)>,
     play_started: Instant,
     window_title: String,
 
@@ -169,6 +181,7 @@ impl App {
             admin: false,
             server_version: String::new(),
             latest: vec![],
+            suggested: vec![],
             resume: vec![],
             next_up: vec![],
             libraries: vec![],
@@ -202,10 +215,17 @@ impl App {
             audio_tracks: vec![],
             sub_tracks: vec![],
             tracks_at: Instant::now(),
+            trick: None,
+            trick_tiles: HashMap::new(),
+            trick_pending: HashSet::new(),
             nav_w: 92.0,
             scroll_seen: Instant::now() - Duration::from_secs(10),
             vol_hot: false,
             tracks_applied: false,
+            meta_ready: false,
+            started: false,
+            user_hold: false,
+            chapters: vec![],
             play_started: Instant::now(),
             window_title: "callephiin".to_string(),
             panel_open: false,
@@ -224,9 +244,9 @@ impl App {
         app
     }
 
-    /// Scale for the home/settings content (the sidebar and player keep their own sizing).
+    /// Scale for the home/settings content (the sidebar and player keep their own sizing)
     /// Automatic mode scales with the monitor's physical resolution relative to 1080p, divided
-    /// by the OS DPI scale so it never stacks on top of Windows display scaling.
+    /// by the OS DPI scale so it never stacks on top of Windows display scaling
     fn content_scale(&self, ctx: &egui::Context) -> f32 {
         if self.cfg.ui_scale > 0.0 {
             return self.cfg.ui_scale.clamp(0.5, 3.0);
@@ -253,6 +273,7 @@ impl App {
     fn home_msg(client: &Client) -> Msg {
         match (client.home_items(40), client.resume_items(12)) {
             (Ok(latest), resume) => Msg::Home {
+                suggested: client.suggested(24),
                 latest,
                 resume: resume.unwrap_or_default(),
                 next_up: client.next_up_items(16),
@@ -264,7 +285,7 @@ impl App {
         }
     }
 
-    /// Mark an item watched on the server, drop it from the rows right away, then reload them.
+    /// Mark an item watched on the server, drop it from the rows right away, then reload them
     fn mark_watched(&mut self, item: Item, ctx: &egui::Context) {
         let Some(client) = self.client.clone() else { return };
         self.resume.retain(|i| i.id != item.id);
@@ -307,7 +328,7 @@ impl App {
         });
     }
 
-    /// Report the current item as stopped, then start `item`.
+    /// Report the current item as stopped, then start `item`
     fn play_episode(&mut self, item: Item, ctx: &egui::Context) {
         if let (Some(p), Some(client)) = (self.player.as_ref(), self.client.clone()) {
             if let Some(info) = p.current.clone() {
@@ -318,7 +339,7 @@ impl App {
         self.start_play(item, ctx);
     }
 
-    /// Load a season's episodes (and, when `with_seasons`, the season list) for the panel.
+    /// Load a season's episodes (and, when `with_seasons`, the season list) for the panel
     fn load_panel(&self, ctx: &egui::Context, series_id: String, season_id: Option<String>, with_seasons: bool) {
         let Some(client) = self.client.clone() else { return };
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
@@ -329,6 +350,50 @@ impl App {
             let _ = tx.send(Msg::Episodes { series_id, seasons, season_id, episodes });
             ctx.request_repaint();
         });
+    }
+
+    /// Hover/scrub preview above the seek bar: trickplay thumbnail (when available) and timestamp
+    fn seek_popup(&mut self, ctx: &egui::Context, client: Option<&Client>, t: f64, x: f32, top: f32, label: Option<&'static str>, item_id: String) {
+        let mut thumb: Option<(egui::TextureId, Rect, egui::Vec2)> = None;
+        if let Some(tr) = self.trick.clone() {
+            let (idx, col, row) = tr.locate(t);
+            if let Some(tex) = self.trick_tiles.get(&idx) {
+                let (tw, th) = (tr.tile_w as f32, tr.tile_h as f32);
+                let uv = Rect::from_min_max(pos2(col as f32 / tw, row as f32 / th), pos2((col + 1) as f32 / tw, (row + 1) as f32 / th));
+                let w = 200.0;
+                thumb = Some((tex.id(), uv, vec2(w, w * tr.thumb_h as f32 / tr.thumb_w as f32)));
+            } else if let (Some(c), true) = (client, self.trick_pending.insert(idx)) {
+                let (c, tx, ctx2) = (c.clone(), self.tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let image = c.trickplay_tile(&tr, idx);
+                    let _ = tx.send(Msg::Tile { item_id, index: idx, image });
+                    ctx2.request_repaint();
+                });
+            }
+        }
+        let text = match label {
+            Some(l) => format!("{}  ·  {}", ui::fmt_time(t), l),
+            None => ui::fmt_time(t),
+        };
+        let w = thumb.map(|(_, _, sz)| sz.x).unwrap_or(0.0).max(90.0);
+        let h = thumb.map(|(_, _, sz)| sz.y + 6.0).unwrap_or(0.0) + 28.0;
+        let screen = ctx.screen_rect();
+        let px = (x - w / 2.0).clamp(screen.left() + 8.0, (screen.right() - w - 8.0).max(8.0));
+        egui::Area::new("seek_popup".into())
+            .fixed_pos(pos2(px, top - h - 10.0))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+                ui.painter().rect_filled(rect.expand(4.0), 8.0, Color32::from_rgba_unmultiplied(12, 14, 20, 235));
+                let mut y = rect.top();
+                if let Some((id, uv, sz)) = thumb {
+                    let img = Rect::from_min_size(pos2(rect.center().x - sz.x / 2.0, y), sz);
+                    egui::Image::new(egui::load::SizedTexture::new(id, sz)).uv(uv).rounding(5.0).paint_at(ui, img);
+                    y += sz.y + 6.0;
+                }
+                ui.painter().text(pos2(rect.center().x, y + 14.0), egui::Align2::CENTER_CENTER, text, egui::FontId::monospace(15.0), Color32::WHITE);
+            });
     }
 
     fn current_item(&self) -> Option<Item> {
@@ -383,13 +448,20 @@ impl App {
                     self.busy = false;
                     self.status = e;
                 }
-                Msg::Home { latest, resume, next_up, libraries, admin, version } => {
+                Msg::Home { suggested, latest, resume, next_up, libraries, admin, version } => {
+                    self.suggested = suggested;
                     self.busy = false;
                     self.server_version = version;
                     self.admin = admin;
                     self.status.clear();
                     if self.selected.is_none() {
-                        self.selected = resume.first().or(latest.first()).cloned();
+                        // random recently-added title until the user highlights something
+                        if !latest.is_empty() {
+                            let n = (uuid::Uuid::new_v4().as_u128() % latest.len() as u128) as usize;
+                            self.selected = latest.get(n).cloned();
+                        } else {
+                            self.selected = resume.first().cloned();
+                        }
                     }
                     self.latest = latest;
                     self.resume = resume;
@@ -446,8 +518,15 @@ impl App {
                             self.last_skip = None;
                             self.audio_tracks.clear();
                             self.sub_tracks.clear();
+                            self.trick = None;
+                            self.trick_tiles.clear();
+                            self.trick_pending.clear();
                             self.tracks_at = Instant::now() - Duration::from_secs(60);
                             self.tracks_applied = false;
+                            self.meta_ready = false;
+                            self.started = false;
+                            self.user_hold = false;
+                            self.chapters.clear();
                             self.play_started = Instant::now();
 
                             if self.panel_open {
@@ -460,7 +539,9 @@ impl App {
                                 client.report_start(&info);
                                 let segments = client.segments(&info.item);
                                 let (prev, next) = client.adjacent_episodes(&info.item);
-                                let _ = tx.send(Msg::Meta { item_id: info.item.id.clone(), segments, prev, next });
+                                let trick = client.trickplay(&info.item.id, &info.media_source_id);
+                                let chapters = client.chapters(&info.item.id);
+                                let _ = tx.send(Msg::Meta { item_id: info.item.id.clone(), segments, prev, next, trick, chapters });
                                 ctx2.request_repaint();
                             });
                         }
@@ -469,8 +550,20 @@ impl App {
                     }
                 }
                 Msg::Play(Err(e)) => self.status = format!("Playback failed: {e}"),
-                Msg::Meta { item_id, segments, prev, next } => {
+                Msg::Tile { item_id, index, image } => {
+                    self.trick_pending.remove(&index);
                     if self.current_item().map(|i| i.id).as_deref() == Some(item_id.as_str()) {
+                        if let Some(img) = image {
+                            let tex = ctx.load_texture(format!("trick_{index}"), img, egui::TextureOptions::LINEAR);
+                            self.trick_tiles.insert(index, tex);
+                        }
+                    }
+                }
+                Msg::Meta { item_id, segments, prev, next, trick, chapters } => {
+                    if self.current_item().map(|i| i.id).as_deref() == Some(item_id.as_str()) {
+                        self.trick = trick;
+                        self.chapters = chapters;
+                        self.meta_ready = true;
                         self.segments = segments;
                         self.prev_ep = prev;
                         self.next_ep = next;
@@ -494,6 +587,9 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages(ctx);
+
+        // wheel scrolling is a bit more sensitive than egui's default
+        ctx.input_mut(|i| i.smooth_scroll_delta *= 2.0);
 
         // Scrollbars are invisible unless the user is scrolling (wheel / touchpad) or dragging one.
         let scrolling = ctx.input(|i| i.raw_scroll_delta != egui::Vec2::ZERO || i.smooth_scroll_delta != egui::Vec2::ZERO);
@@ -555,32 +651,35 @@ impl eframe::App for App {
         let nav_hot = ctx
             .input(|i| i.pointer.latest_pos())
             .map_or(false, |p| p.x <= self.nav_w + 4.0 && p.y >= 0.0);
-        let nav_w = ctx.animate_value_with_time(egui::Id::new("nav_w"), if nav_hot { 92.0 } else { 58.0 }, 0.12);
+        let nav_w = ctx.animate_value_with_time(egui::Id::new("nav_w"), if nav_hot { 92.0 } else { 58.0 }, 0.2);
         self.nav_w = nav_w;
-        let compact = nav_w < 75.0;
+        let t = ((nav_w - 58.0) / 34.0).clamp(0.0, 1.0);
         egui::SidePanel::left("nav")
             .exact_width(nav_w)
             .resizable(false)
             .frame(egui::Frame::none().fill(PANEL).inner_margin(egui::Margin::symmetric(10.0, 18.0)))
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui::logo(ui, if compact { 30.0 } else { 46.0 });
-                    ui.add_space(if compact { 14.0 } else { 18.0 });
-                    if ui::nav_button(ui, "home", "Home", self.tab == Tab::Home, 62.0, compact) {
+                    // fixed-height logo slot so the buttons below never shift while the bar animates
+                    let logo = 30.0 + 16.0 * t;
+                    ui.add_space((46.0 - logo) / 2.0);
+                    ui::logo(ui, logo);
+                    ui.add_space((46.0 - logo) / 2.0 + 18.0);
+                    if ui::nav_button(ui, "home", "Home", self.tab == Tab::Home, 62.0, t) {
                         self.go_tab(Tab::Home);
                     }
                     ui.add_space(6.0);
-                    if ui::nav_button(ui, "search", "Search", self.tab == Tab::Search, 62.0, compact) {
+                    if ui::nav_button(ui, "search", "Search", self.tab == Tab::Search, 62.0, t) {
                         self.go_tab(Tab::Search);
                     }
                     ui.add_space(6.0);
-                    if ui::nav_button(ui, "⚙", "Settings", self.tab == Tab::Settings, 62.0, compact) {
+                    if ui::nav_button(ui, "⚙", "Settings", self.tab == Tab::Settings, 62.0, t) {
                         self.go_tab(Tab::Settings);
                     }
                     if self.admin {
                         ui.add_space(6.0);
                         // Opens the Jellyfin admin dashboard in the default browser.
-                        if ui::nav_button(ui, "🖥", "Admin", false, 62.0, compact) {
+                        if ui::nav_button(ui, "🖥", "Admin", false, 62.0, t) {
                             self.open_dashboard();
                         }
                     }
@@ -588,7 +687,7 @@ impl eframe::App for App {
                 // profile avatar at the bottom of the sidebar
                 ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                     let prof = self.cfg.profile(&self.cfg.last_profile).cloned();
-                    if profiles::sidebar_avatar(ui, prof.as_ref(), if compact { 34.0 } else { 44.0 }).clicked() {
+                    if profiles::sidebar_avatar(ui, prof.as_ref(), 34.0 + 10.0 * t).clicked() {
                         self.view = View::Switcher;
                     }
                 });
@@ -611,6 +710,22 @@ impl eframe::App for App {
 
 // ------------------------------------------------------------------------------ screens
 
+/// Play/pause; before the first frame is shown it only records the wish to stay paused
+fn toggle_play(player: &Player, started: bool, hold: &mut bool) {
+    if started {
+        player.toggle_pause();
+    } else {
+        *hold = !*hold;
+    }
+}
+
+/// Height of four rows in a track menu (measured from the real row height)
+fn track_list_h(ui: &egui::Ui) -> f32 {
+    let text = ui.text_style_height(&egui::TextStyle::Button);
+    let row = ui.spacing().interact_size.y.max(text + 2.0 * ui.spacing().button_padding.y);
+    (row + ui.spacing().item_spacing.y) * 4.0
+}
+
 impl App {
 
     fn home_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: f32) {
@@ -622,7 +737,11 @@ impl App {
         let mut open_title: Option<Item> = None;
         let mut open_item: Option<Item> = None;
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let mut area = egui::ScrollArea::vertical().id_salt("home_scroll").auto_shrink([false, false]);
+        if std::mem::take(&mut self.scroll_reset) {
+            area = area.vertical_scroll_offset(0.0);
+        }
+        area.show(ui, |ui| {
             if let Some(sel) = self.selected.clone() {
                 let mut opts = ui::HeroOpts { link_title: true, ..Default::default() };
                 let mut hero_sel = sel.clone();
@@ -663,6 +782,12 @@ impl App {
             ui.label(RichText::new("Recently added").size(18.0 * s).strong());
             ui.add_space(8.0 * s);
             ui::poster_row(ui, &client, &self.latest, s, "latest_row", &mut open_title, &mut hover);
+            if !self.suggested.is_empty() {
+                ui.add_space(18.0 * s);
+                ui.label(RichText::new("Suggested").size(18.0 * s).strong());
+                ui.add_space(8.0 * s);
+                ui::poster_row(ui, &client, &self.suggested, s, "suggested_row", &mut open_title, &mut hover);
+            }
 
             if self.busy {
                 ui.add_space(12.0 * s);
@@ -697,7 +822,7 @@ impl App {
             lib,
             key: SortKey::Year,
             descending: true,
-            page_size: PAGE_SIZES[0],
+            page_size: if PAGE_SIZES.contains(&self.cfg.library_page_size) { self.cfg.library_page_size } else { PAGE_SIZES[0] },
             page: 0,
             items: vec![],
             total: 0,
@@ -708,7 +833,7 @@ impl App {
         self.load_library(ctx);
     }
 
-    /// (Re)fetch the current page of the open library.
+    /// (Re)fetch the current page of the open library
     fn load_library(&mut self, ctx: &egui::Context) {
         let Some(client) = self.client.clone() else { return };
         let Some(v) = self.library.as_mut() else { return };
@@ -734,7 +859,7 @@ impl App {
 
         let (mut back, mut sort_changed, mut new_page) = (false, false, None::<usize>);
         let mut size_changed = false;
-        let mut play: Option<Item> = None;
+        let play: Option<Item> = None;
         let mut open_item: Option<Item> = None;
 
         let mut area = egui::ScrollArea::vertical().id_salt("library_scroll").auto_shrink([false, false]);
@@ -805,6 +930,10 @@ impl App {
                 v.descending = desc;
                 v.page_size = size;
                 v.page = 0;
+            }
+            if size_changed {
+                self.cfg.library_page_size = size;
+                self.cfg.save();
             }
             self.scroll_reset = true;
             self.load_library(ctx);
@@ -1084,7 +1213,7 @@ impl App {
         // --- sync Discord + server progress -----------------------------------------
         let pos = player.position();
         let dur = player.duration();
-        let paused = player.paused();
+        let paused = if self.started { player.paused() } else { self.user_hold };
         if let Ok(mut g) = self.discord_now.lock() {
             let item = &info.item;
             *g = Some(NowPlaying {
@@ -1127,7 +1256,8 @@ impl App {
             self.sub_tracks = player.tracks(TrackKind::Sub);
             self.tracks_at = Instant::now();
         }
-        if !self.tracks_applied && !self.audio_tracks.is_empty() && self.play_started.elapsed() > Duration::from_millis(1200) {
+        let waited = self.play_started.elapsed();
+        if !self.tracks_applied && ((!self.audio_tracks.is_empty() && waited > Duration::from_millis(400)) || waited > Duration::from_secs(6)) {
             self.tracks_applied = true;
             if self.cfg.remember_tracks {
                 let series = info.item.series_id.clone().filter(|_| info.item.is_episode());
@@ -1142,6 +1272,13 @@ impl App {
                     }
                     self.tracks_at = Instant::now() - Duration::from_secs(60);
                 }
+            }
+        }
+        // start only once tracks, chapters and intro / credits markers are all ready (black until then)
+        if !self.started && self.tracks_applied && (self.meta_ready || waited > Duration::from_secs(6)) {
+            self.started = true;
+            if !self.user_hold {
+                let _ = player.mpv.set_property("pause", false);
             }
         }
 
@@ -1166,7 +1303,7 @@ impl App {
             )
         });
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        if space { player.toggle_pause(); }
+        if space { toggle_play(player, self.started, &mut self.user_hold); }
         if left { player.seek_by(-(self.cfg.skip_back_secs as f64)); }
         if right { player.seek_by(self.cfg.skip_fwd_secs as f64); }
         if f_key { ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen)); }
@@ -1184,10 +1321,29 @@ impl App {
         let screen = ctx.screen_rect();
         let render = player.render.clone();
         egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::BLACK)).show(ctx, |ui| {
-            let cb = egui_glow::CallbackFn::new(move |info, _painter| {
+            let started = self.started;
+            let cb = egui_glow::CallbackFn::new(move |info, painter| {
+                if !started {
+                    return; // plain black until playback really starts
+                }
+                use egui_glow::glow::HasContext;
                 let [w, h] = info.screen_size_px;
+                let gl = painter.gl();
+                unsafe {
+                    // mpv writes straight to the window: no blending, all channels writable
+                    gl.disable(egui_glow::glow::BLEND);
+                    gl.color_mask(true, true, true, true);
+                }
                 if let Ok(r) = render.lock() {
                     let _ = r.0.render::<()>(0, w as i32, h as i32, true);
+                }
+                unsafe {
+                    // force the alpha channel opaque so the compositor never shows the video see-through
+                    gl.color_mask(false, false, false, true);
+                    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                    gl.clear(egui_glow::glow::COLOR_BUFFER_BIT);
+                    gl.color_mask(true, true, true, true);
+                    gl.enable(egui_glow::glow::BLEND);
                 }
             });
             ui.painter().add(egui::PaintCallback { rect: screen, callback: Arc::new(cb) });
@@ -1195,7 +1351,7 @@ impl App {
             if resp.double_clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
             } else if resp.clicked() {
-                player.toggle_pause();
+                toggle_play(player, self.started, &mut self.user_hold);
             }
         });
 
@@ -1252,7 +1408,10 @@ impl App {
         // --- overlay: top (back + title logo) ------------------------------------------------
         let item = info.item.clone();
         let art_id = item.art_id().to_string();
-        let has_logo = item.image_tags.contains_key("Logo") || item.parent_logo_image_tag.is_some();
+        let has_logo = match &item.owner {
+            Some((_, logo)) => *logo,
+            None => item.image_tags.contains_key("Logo") || item.parent_logo_image_tag.is_some(),
+        };
         let logo_url = client.as_ref().map(|c| c.image_url(&art_id, "Logo", 260));
 
         egui::Area::new("player_top".into())
@@ -1283,7 +1442,7 @@ impl App {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
                             if r.clicked() {
-                                act.open_series = Some(if item.is_episode() { item.series_stub() } else { item.clone() });
+                                act.open_series = Some(if item.is_episode() || item.owner.is_some() { item.series_stub() } else { item.clone() });
                             }
                         }
                         _ => {
@@ -1292,7 +1451,7 @@ impl App {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
                             if r.clicked() {
-                                act.open_series = Some(if item.is_episode() { item.series_stub() } else { item.clone() });
+                                act.open_series = Some(if item.is_episode() || item.owner.is_some() { item.series_stub() } else { item.clone() });
                             }
                         }
                     }
@@ -1402,9 +1561,11 @@ impl App {
                 },
             })
             .collect();
+        let chapter_marks: Vec<f64> = self.chapters.iter().skip(1).map(|c| c.1).filter(|t| *t > 1.0).collect();
         let (has_prev, has_next) = (self.prev_ep.is_some(), self.next_ep.is_some());
         let is_episode = info.item.is_episode();
         let mut refresh_tracks = false;
+        let mut seek_hover: Option<(f64, f32, f32, Option<&'static str>)> = None;
         egui::Area::new("player_bottom".into())
             .fixed_pos(pos2(0.0, screen.height() - 150.0))
             .order(egui::Order::Foreground)
@@ -1416,10 +1577,28 @@ impl App {
                     // time bar with intro / credits markers
                     let total = dur.max(1.0);
                     let shown = self.seek_drag.unwrap_or(pos);
-                    ui.horizontal(|ui| {
-                        ui.add_sized(vec2(64.0, 20.0), egui::Label::new(RichText::new(ui::fmt_time(shown)).monospace().color(Color32::WHITE)));
-                        let bar_w = (ui.available_width() - 64.0 - ui.spacing().item_spacing.x).max(100.0);
-                        match ui::seek_bar(ui, bar_w, shown, total, &marks) {
+                    // chapter title (left) and end time (right) just above the timeline
+                    let small = egui::FontId::proportional(13.0);
+                    let tint = Color32::from_gray(200);
+                    if let Some((name, _)) = self.chapters.iter().rev().find(|c| c.1 <= shown + 0.5).filter(|c| !c.0.trim().is_empty()) {
+                        ui.painter().text(pos2(r.left(), r.top() - 5.0), egui::Align2::LEFT_BOTTOM, name, small.clone(), tint);
+                    }
+                    if dur > 1.0 {
+                        let end = chrono::Local::now() + chrono::Duration::milliseconds(((dur - pos).max(0.0) * 1000.0) as i64);
+                        ui.painter().text(pos2(r.right(), r.top() - 5.0), egui::Align2::RIGHT_BOTTOM, format!("Ends at {}", end.format("%H:%M")), small, tint);
+                    }
+                    // explicit layout: [current time] gap [bar] gap [total time], gaps measured from the text itself
+                    let (row, _) = ui.allocate_exact_size(vec2(r.width(), 26.0), Sense::hover());
+                    let tfont = egui::FontId::proportional(15.5);
+                    let (cur_s, tot_s) = (ui::fmt_time(shown), ui::fmt_time(total));
+                    let tw = |t: &str| ui.painter().layout_no_wrap(t.to_owned(), tfont.clone(), Color32::WHITE).size().x;
+                    let side = tw(&tot_s).max(tw(&"0".repeat(cur_s.len().max(tot_s.len()))));
+                    ui.painter().text(pos2(row.left(), row.center().y), egui::Align2::LEFT_CENTER, &cur_s, tfont.clone(), Color32::WHITE);
+                    ui.painter().text(pos2(row.right(), row.center().y), egui::Align2::RIGHT_CENTER, &tot_s, tfont, Color32::from_gray(200));
+                    let gap = 14.0;
+                    let bar_rect = Rect::from_min_max(pos2(row.left() + side + gap, row.top()), pos2(row.right() - side - gap, row.bottom()));
+                    ui.allocate_new_ui(UiBuilder::new().max_rect(bar_rect), |ui| {
+                        match ui::seek_bar(ui, bar_rect.width().max(100.0), shown, total, &marks, &chapter_marks, &mut seek_hover) {
                             SeekEvent::Drag(t) => self.seek_drag = Some(t),
                             SeekEvent::Commit(t) => {
                                 player.seek_to(t);
@@ -1427,7 +1606,6 @@ impl App {
                             }
                             SeekEvent::None => {}
                         }
-                        ui.add_sized(vec2(64.0, 20.0), egui::Label::new(RichText::new(ui::fmt_time(total)).monospace().color(Color32::from_gray(190))));
                     });
                     ui.add_space(2.0);
                     ui.allocate_ui_with_layout(vec2(ui.available_width(), 44.0), Layout::left_to_right(Align::Center), |ui| {
@@ -1435,7 +1613,7 @@ impl App {
                         if ui::icon_button(ui, Icon::SkipBack, 34.0, true).on_hover_text(format!("Back {}s", skip_back)).clicked() { player.seek_by(-skip_back); }
                         let pp = if paused { Icon::Play } else { Icon::Pause };
                         if ui::icon_button(ui, pp, 40.0, true).clicked() {
-                            player.toggle_pause();
+                            toggle_play(player, self.started, &mut self.user_hold);
                         }
                         if ui::icon_button(ui, Icon::SkipFwd, 34.0, true).on_hover_text(format!("Forward {}s", skip_fwd)).clicked() { player.seek_by(skip_fwd); }
                         if ui::icon_button(ui, Icon::Next, 34.0, has_next).clicked() && has_next { act.next = true; }
@@ -1446,22 +1624,25 @@ impl App {
                         let sub_id = egui::Id::new("subtitle_menu");
                         if sub_btn.clicked() { ui.memory_mut(|m| m.toggle_popup(sub_id)); }
                         egui::popup_above_or_below_widget(ui, sub_id, &sub_btn, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-                            ui.set_min_width(280.0);
+                            ui.set_width(300.0);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                             ui.label(RichText::new("Subtitles").strong());
                             ui.separator();
                             let none_selected = !sub_tracks.iter().any(|t| t.selected);
-                            if ui.selectable_label(none_selected, "Off").clicked() {
-                                player.set_sub(None);
-                                act.remember_sub = Some(None);
-                                refresh_tracks = true;
-                            }
-                            for t in &sub_tracks {
-                                if ui.selectable_label(t.selected, ui::track_label(t)).clicked() {
-                                    player.set_sub(Some(t.id));
-                                    act.remember_sub = Some(Some(t.clone()));
+                            egui::ScrollArea::vertical().max_height(track_list_h(ui)).show(ui, |ui| {
+                                if ui.selectable_label(none_selected, "Off").clicked() {
+                                    player.set_sub(None);
+                                    act.remember_sub = Some(None);
                                     refresh_tracks = true;
                                 }
-                            }
+                                for t in &sub_tracks {
+                                    if ui.selectable_label(t.selected, ui::track_label(t)).on_hover_text(ui::track_label(t)).clicked() {
+                                        player.set_sub(Some(t.id));
+                                        act.remember_sub = Some(Some(t.clone()));
+                                        refresh_tracks = true;
+                                    }
+                                }
+                            });
                         });
 
                         // Audio list
@@ -1469,19 +1650,22 @@ impl App {
                         let aud_id = egui::Id::new("audio_menu");
                         if aud_btn.clicked() { ui.memory_mut(|m| m.toggle_popup(aud_id)); }
                         egui::popup_above_or_below_widget(ui, aud_id, &aud_btn, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-                            ui.set_min_width(280.0);
+                            ui.set_width(300.0);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                             ui.label(RichText::new("Audio").strong());
                             ui.separator();
                             if audio_tracks.is_empty() {
                                 ui.label(RichText::new("No audio tracks").color(MUTED));
                             }
-                            for t in &audio_tracks {
-                                if ui.selectable_label(t.selected, ui::track_label(t)).clicked() {
-                                    player.set_audio(t.id);
-                                    act.remember_audio = Some(t.clone());
-                                    refresh_tracks = true;
+                            egui::ScrollArea::vertical().max_height(track_list_h(ui)).show(ui, |ui| {
+                                for t in &audio_tracks {
+                                    if ui.selectable_label(t.selected, ui::track_label(t)).on_hover_text(ui::track_label(t)).clicked() {
+                                        player.set_audio(t.id);
+                                        act.remember_audio = Some(t.clone());
+                                        refresh_tracks = true;
+                                    }
                                 }
-                            }
+                            });
                         });
 
                         if info.transcoding {
@@ -1518,12 +1702,15 @@ impl App {
         if refresh_tracks {
             self.tracks_at = Instant::now() - Duration::from_secs(60);
         }
+        if let Some((t, x, top, label)) = seek_hover {
+            self.seek_popup(ctx, client.as_ref(), t, x, top, label, info.item.id.clone());
+        }
         ctx.request_repaint_after(Duration::from_millis(250));
         self.apply_actions(ctx, act);
     }
 }
 
-/// egui's built-in fonts have no Japanese / Korean / Chinese glyphs, so borrow the system's CJK fonts.
+/// Borrow system's CJK fonts since egui doesn't have built-in JP/KR/CN glyphs
 fn install_cjk_fonts(ctx: &egui::Context) {
     const CANDIDATES: [&str; 14] = [
         r"C:\Windows\Fonts\YuGothM.ttc",
@@ -1583,7 +1770,7 @@ fn stored_track(t: &Track) -> StoredTrack {
 }
 
 /// Find the track in `tracks` that best matches a remembered one, by names rather than index:
-/// language + title (+ forced flag), then title alone, then language + codec, then language.
+/// language + title (+ forced flag), then title alone, then language + codec, then language
 fn find_match(tracks: &[Track], w: &StoredTrack) -> Option<i64> {
     let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
     let lang_ok = !w.lang.is_empty();
@@ -1603,7 +1790,7 @@ fn find_match(tracks: &[Track], w: &StoredTrack) -> Option<i64> {
         .map(|t| t.id)
 }
 
-/// "Previous  Page 2 of 7 · 168 titles  Next"
+/// "Previous  Page 2 of 7 · 168 titles  Next" formatting
 fn page_controls(ui: &mut egui::Ui, page: usize, pages: usize, total: usize, s: f32, new_page: &mut Option<usize>) {
     ui.horizontal(|ui| {
         if ui.add_enabled(page > 0, egui::Button::new("Previous")).clicked() {

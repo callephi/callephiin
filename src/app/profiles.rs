@@ -1,6 +1,6 @@
-//! Profiles: switcher screen, sign-in form, sidebar avatar.
+//! Profiles: switcher screen, sign-in form, sidebar avatar
 
-use super::{App, Msg, Tab};
+use super::{App, Tab};
 use crate::config::Profile;
 use crate::jellyfin::Client;
 use crate::ui::{self, ACCENT, BG, MUTED, PANEL};
@@ -10,7 +10,7 @@ use eframe::egui::{self, pos2, vec2, Align, Align2, Color32, FontId, Layout, Rec
 pub(super) enum View {
     Normal,
     Switcher,
-    /// Sign-in form (add a profile / sign in again).
+    /// Sign-in form to add a profile or sign in
     Add,
 }
 
@@ -37,7 +37,7 @@ fn paint_avatar(p: &egui::Painter, c: egui::Pos2, d: f32, name: &str, seed: &str
     p.text(c, Align2::CENTER_CENTER, initial, FontId::proportional(d * 0.46), Color32::WHITE);
 }
 
-/// Round profile button for the bottom of the sidebar.
+/// Round profile button for the bottom of the sidebar
 pub(super) fn sidebar_avatar(ui: &mut egui::Ui, profile: Option<&Profile>, d: f32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(d, d), Sense::click());
     let (name, seed) = profile.map(|p| (p.display_name(), p.id.clone())).unwrap_or(("?".into(), "?".into()));
@@ -50,7 +50,7 @@ pub(super) fn sidebar_avatar(ui: &mut egui::Ui, profile: Option<&Profile>, d: f3
 }
 
 impl App {
-    /// Forget everything loaded for the previous account.
+    /// Forgets everything cached from previous account
     pub(super) fn reset_session(&mut self) {
         self.admin = false;
         self.server_version.clear();
@@ -93,7 +93,7 @@ impl App {
         self.view = View::Add;
     }
 
-    /// Sign the active account out (its profile stays in the list).
+    /// Sign the active account out (but its profile stays in the list)
     pub(super) fn sign_out_active(&mut self) {
         self.cfg.sign_out();
         self.cfg.save();
@@ -186,17 +186,16 @@ impl App {
 
                 ui.add_space(26.0 * s);
                 ui.horizontal(|ui| {
-                    let bw = if self.client.is_some() && !self.manage { 330.0 * s } else { 160.0 * s };
-                    ui.add_space(((ui.available_width() - bw) / 2.0).max(0.0));
+                    ui.add_space(((ui.available_width() - 160.0 * s) / 2.0).max(0.0));
                     if ui::pill_button(ui, if self.manage { "Done" } else { "Manage accounts" }, 15.0 * s, 38.0 * s, 20.0 * s, 150.0 * s, 19.0 * s, Color32::from_rgb(0x24, 0x28, 0x34), Color32::WHITE).clicked() {
                         self.manage = !self.manage;
-                    }
-                    if self.client.is_some() && !self.manage && ui::pill_button(ui, "Back", 15.0 * s, 38.0 * s, 20.0 * s, 100.0 * s, 19.0 * s, Color32::from_rgb(0x24, 0x28, 0x34), Color32::WHITE).clicked() {
-                        close = true;
                     }
                 });
             });
         });
+        if self.client.is_some() && !self.manage && corner_cross(ctx, s) {
+            close = true;
+        }
         if let Some(id) = remove {
             self.remove_profile(&id);
         }
@@ -264,21 +263,7 @@ impl App {
             });
         });
         if !self.cfg.profiles.is_empty() {
-            // cross in the top-right corner: back to the profile switcher
-            egui::Area::new("login_close".into()).order(egui::Order::Foreground).fixed_pos(pos2(ctx.screen_rect().right() - 70.0 * s, 24.0 * s)).show(ctx, |ui| {
-                let (r, resp) = ui.allocate_exact_size(vec2(44.0 * s, 44.0 * s), Sense::click());
-                if resp.hovered() {
-                    ui.painter().circle_filled(r.center(), 22.0 * s, Color32::from_white_alpha(28));
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                let st = Stroke::new(2.4_f32, if resp.hovered() { Color32::WHITE } else { MUTED });
-                let k = 7.0 * s;
-                ui.painter().line_segment([r.center() + vec2(-k, -k), r.center() + vec2(k, k)], st);
-                ui.painter().line_segment([r.center() + vec2(-k, k), r.center() + vec2(k, -k)], st);
-                if resp.clicked() {
-                    back = true;
-                }
-            });
+            back = corner_cross(ctx, s);
         }
         if back {
             self.status.clear();
@@ -287,5 +272,20 @@ impl App {
     }
 }
 
-#[allow(dead_code)]
-fn _unused(_: Msg) {}
+/// Exit button for profile switcher
+fn corner_cross(ctx: &egui::Context, s: f32) -> bool {
+    let mut clicked = false;
+    egui::Area::new("corner_close".into()).order(egui::Order::Foreground).fixed_pos(pos2(ctx.screen_rect().right() - 70.0 * s, 24.0 * s)).show(ctx, |ui| {
+        let (r, resp) = ui.allocate_exact_size(vec2(44.0 * s, 44.0 * s), Sense::click());
+        if resp.hovered() {
+            ui.painter().circle_filled(r.center(), 22.0 * s, Color32::from_white_alpha(28));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let st = Stroke::new(2.4_f32, if resp.hovered() { Color32::WHITE } else { MUTED });
+        let k = 7.0 * s;
+        ui.painter().line_segment([r.center() + vec2(-k, -k), r.center() + vec2(k, k)], st);
+        ui.painter().line_segment([r.center() + vec2(-k, k), r.center() + vec2(k, -k)], st);
+        clicked = resp.clicked();
+    });
+    clicked
+}

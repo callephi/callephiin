@@ -28,7 +28,7 @@ pub struct Item {
     pub series_id: Option<String>,
     /// For library folders: "movies", "tvshows", ...
     pub collection_type: Option<String>,
-    /// For series: total episode count.
+    /// For series: total episode count
     pub recursive_item_count: Option<u32>,
     pub season_id: Option<String>,
     pub parent_index_number: Option<u32>,
@@ -37,27 +37,33 @@ pub struct Item {
     pub image_tags: HashMap<String, String>,
     #[serde(default)]
     pub backdrop_image_tags: Vec<String>,
-    /// Present on episodes when the parent series has a title logo.
+    /// Present on episodes when the parent series has a title logo
     pub parent_logo_image_tag: Option<String>,
     #[serde(default)]
     pub parent_backdrop_image_tags: Vec<String>,
     #[serde(default)]
     pub user_data: Option<UserData>,
-    /// Cast and crew (only returned by the single-item endpoint).
+    /// Cast and crew (only returned by the single-item endpoint)
     #[serde(default)]
     pub people: Vec<Person>,
     pub original_title: Option<String>,
-    /// ISO timestamp, e.g. "2024-10-05T00:00:00.0000000Z".
+    /// ISO timestamp, e.g. "2026-10-05T00:00:00.0000000Z"
     pub premiere_date: Option<String>,
-    /// For seasons: number of episodes.
+    /// For seasons: number of episodes
     pub child_count: Option<u32>,
-    /// Specials placed in the watch order (NFO displayseason / displayepisode); -1 or absent = unplaced.
+    /// Specials placed in the watch order (NFO displayseason / displayepisode); -1 or absent = unplaced
     pub airs_before_season_number: Option<i32>,
     pub airs_before_episode_number: Option<i32>,
     #[serde(default)]
     pub studios: Vec<Named>,
     #[serde(default)]
     pub production_locations: Vec<String>,
+    /// Client-side tag for extras: (owning show/movie id, owner has a logo)
+    #[serde(skip)]
+    pub owner: Option<(String, bool)>,
+    /// Client-side tag on a person's page: the first role they play in this title
+    #[serde(skip)]
+    pub role: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -87,19 +93,21 @@ pub struct SearchResults {
     pub people: Vec<Person>,
 }
 
-/// Everything the title page needs for the first paint.
+/// Everything the title page needs for the first paint
 #[derive(Clone, Debug)]
 pub struct TitleData {
     pub item: Item,
-    /// What "Play" starts for a show (next unwatched episode).
+    /// What "Play" starts for a show (next unwatched episode)
     pub next_ep: Option<Item>,
     pub similar: Vec<Item>,
     pub seasons: Vec<Item>,
-    /// Season whose episodes are in `episodes` (None for movies).
+    /// Season whose episodes are in `episodes` (None for movies)
     pub season_id: Option<String>,
     pub episodes: Vec<Item>,
     pub series_extras: Vec<Item>,
     pub season_extras: Vec<Item>,
+    /// Episode to line the episode row up with (last one watched)
+    pub focus: Option<String>,
 }
 
 fn enc(s: &str) -> String {
@@ -119,9 +127,10 @@ fn enc(s: &str) -> String {
 pub struct UserData {
     #[serde(default)]
     pub playback_position_ticks: i64,
-    pub played_percentage: Option<f64>,
     #[serde(default)]
     pub played: bool,
+    #[serde(default)]
+    pub is_favorite: bool,
 }
 
 impl Item {
@@ -133,7 +142,7 @@ impl Item {
         self.kind == "Episode"
     }
 
-    /// "S1:E3" style code, if the item has season/episode numbers.
+    /// "S1:E3" style code, if the item has season/episode numbers
     pub fn ep_code(&self) -> Option<String> {
         match (self.parent_index_number, self.index_number) {
             (Some(s), Some(e)) => Some(format!("S{s}:E{e}")),
@@ -142,7 +151,7 @@ impl Item {
         }
     }
 
-    /// "S1:E3 · Episode Title" for episodes, plain title otherwise.
+    /// "S1:E3 · Episode Title" for episodes, plain title otherwise
     pub fn episode_label(&self) -> String {
         match self.ep_code() {
             Some(c) if self.name.is_empty() => c,
@@ -151,20 +160,20 @@ impl Item {
         }
     }
 
-    /// Fraction watched (0..1) from the user's saved position.
+    /// Fraction watched (0..1) from the user's saved position
     pub fn progress(&self) -> f32 {
         let total = self.run_time_ticks.unwrap_or(0) as f64;
         let pos = self.user_data.as_ref().map(|u| u.playback_position_ticks as f64).unwrap_or(0.0);
         if total > 0.0 { (pos / total).clamp(0.0, 1.0) as f32 } else { 0.0 }
     }
 
-    /// Seconds left according to the saved position.
+    /// Seconds left according to the saved position
     pub fn remaining_seconds(&self) -> Option<f64> {
         let total = self.run_time_ticks? as f64 / 10_000_000.0;
         Some((total - self.resume_seconds()).max(0.0))
     }
 
-    /// Title shown as the main line (series name for episodes).
+    /// Title shown as the main line (series name for episodes)
     pub fn display_title(&self) -> String {
         if self.is_episode() {
             self.series_name.clone().unwrap_or_else(|| self.name.clone())
@@ -173,16 +182,18 @@ impl Item {
         }
     }
 
-    /// The item whose artwork represents the show (series for episodes).
+    /// The item whose artwork represents the show (series for episodes)
     pub fn art_id(&self) -> &str {
-        if self.is_episode() {
+        if let Some((o, _)) = &self.owner {
+            o
+        } else if self.is_episode() {
             self.series_id.as_deref().unwrap_or(&self.id)
         } else {
             &self.id
         }
     }
 
-    /// Minimal series item for opening a show page from one of its episodes.
+    /// Minimal series item for opening a show page from one of its episodes
     pub fn series_stub(&self) -> Item {
         Item {
             id: self.art_id().to_string(),
@@ -192,7 +203,7 @@ impl Item {
         }
     }
 
-    /// Native / original title when it differs from the displayed one.
+    /// Native / original title when it differs from the displayed one
     pub fn native_title(&self) -> Option<&str> {
         self.original_title.as_deref().filter(|t| !t.is_empty() && *t != self.name)
     }
@@ -230,7 +241,7 @@ struct AuthUser {
     id: String,
 }
 
-/// Everything the player needs to start a stream.
+/// Everything the player needs to start a stream
 #[derive(Clone, Debug)]
 pub struct PlayInfo {
     pub item: Item,
@@ -241,6 +252,29 @@ pub struct PlayInfo {
     pub start_seconds: f64,
     /// (url, title, language) of external subtitle tracks to load into mpv.
     pub external_subs: Vec<(String, String, String)>,
+}
+
+/// Trickplay sheet layout for one video
+#[derive(Clone, Debug)]
+pub struct Trick {
+    pub item_id: String,
+    pub media_source_id: String,
+    pub width: u32,
+    pub thumb_w: u32,
+    pub thumb_h: u32,
+    pub tile_w: u32,
+    pub tile_h: u32,
+    pub count: u32,
+    pub interval_ms: u64,
+}
+
+impl Trick {
+    /// (sheet index, column, row) holding the thumbnail for time `t` seconds
+    pub fn locate(&self, t: f64) -> (u32, u32, u32) {
+        let n = ((t * 1000.0 / self.interval_ms as f64) as u32).min(self.count.saturating_sub(1));
+        let per = self.tile_w * self.tile_h;
+        (n / per, n % per % self.tile_w, n % per / self.tile_w)
+    }
 }
 
 #[derive(Clone)]
@@ -273,7 +307,7 @@ impl Client {
         )
     }
 
-    /// Log in with username/password and return an updated config.
+    /// Log in with username/password and return an updated config
     pub fn authenticate(cfg: &Config, password: &str) -> Result<Config> {
         let c = Self::from_config(cfg);
         let resp: AuthResponse = c
@@ -313,7 +347,7 @@ impl Client {
 
     const FIELDS: &'static str = "Overview,Genres,CommunityRating,OfficialRating,RunTimeTicks,ProductionYear,OriginalTitle";
 
-    /// Latest movies + series for the home screen.
+    /// Latest media for the home screen
     pub fn home_items(&self, limit: u32) -> Result<Vec<Item>> {
         let path = format!(
             "/Users/{}/Items?Recursive=true&IncludeItemTypes=Movie,Series&SortBy=DateCreated&SortOrder=Descending&Limit={limit}&Fields={}&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop,Logo",
@@ -323,7 +357,7 @@ impl Client {
         Ok(self.get(&path)?.json::<ItemsResponse>()?.items)
     }
 
-    /// Items the user can resume.
+    /// Items the user can resume
     pub fn resume_items(&self, limit: u32) -> Result<Vec<Item>> {
         let path = format!(
             "/Users/{}/Items/Resume?Limit={limit}&MediaTypes=Video&Fields={}&EnableImageTypes=Primary,Backdrop,Logo",
@@ -369,13 +403,13 @@ impl Client {
         format!("{}/Items/{id}/Images/{kind}?maxHeight={max_height}&quality=90", self.base)
     }
 
-    /// Decide whether the configured server is on a local/private network.
+    /// Decide whether the configured server is on a local/private network
     pub fn is_local(&self) -> bool {
         is_local_url(&self.base)
     }
 
     /// Ask the server how to play `item`: Direct Play when allowed and local,
-    /// bitrate-capped HLS transcode (H.264/HEVC) otherwise.
+    /// bitrate-capped HLS transcode (H.264/HEVC) otherwise
     pub fn play_info(&self, item: &Item, cfg: &Config) -> Result<PlayInfo> {
         let direct = match cfg.stream_mode {
             StreamMode::AlwaysDirect => true,
@@ -467,10 +501,43 @@ impl Client {
     pub fn report_progress(&self, info: &PlayInfo, pos: f64, paused: bool) {
         self.report("/Sessions/Playing/Progress", info, pos, paused);
     }
-    /// Mark an item as watched (removes it from Continue Watching / Next Up progress).
+    /// Mark an item as watched (removes it from Continue Watching / Next Up progress)
     pub fn mark_played(&self, id: &str) -> Result<()> {
         self.post(&format!("/Users/{}/PlayedItems/{id}", self.user_id), &json!({}))?;
         Ok(())
+    }
+
+    pub fn set_favorite(&self, id: &str, fav: bool) -> Result<()> {
+        let path = format!("/Users/{}/FavoriteItems/{id}", self.user_id);
+        if fav {
+            self.post(&path, &json!({}))?;
+        } else {
+            self.http.delete(format!("{}{}", self.base, path)).header("Authorization", self.auth_header()).send()?.error_for_status()?;
+        }
+        Ok(())
+    }
+
+    /// Random movies and shows from anywhere on the server
+    pub fn suggested(&self, limit: u32) -> Vec<Item> {
+        let path = format!(
+            "/Users/{}/Items?Recursive=true&IncludeItemTypes=Movie,Series&SortBy=Random&Limit={limit}&Fields={}&ImageTypeLimit=1&EnableImageTypes=Primary",
+            self.user_id,
+            Self::FIELDS
+        );
+        self.items(&path)
+    }
+
+    /// Chapter (name, start seconds) list of an item
+    pub fn chapters(&self, item_id: &str) -> Vec<(String, f64)> {
+        let path = format!("/Users/{}/Items/{item_id}?Fields=Chapters", self.user_id);
+        let Some(v) = self.get(&path).ok().and_then(|r| r.json::<Value>().ok()) else { return vec![] };
+        v["Chapters"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| (c["Name"].as_str().unwrap_or("").to_string(), c["StartPositionTicks"].as_i64().unwrap_or(0) as f64 / 10_000_000.0))
+            .collect()
     }
 
     pub fn mark_unplayed(&self, id: &str) -> Result<()> {
@@ -557,7 +624,7 @@ pub enum SegmentKind {
     Outro,
 }
 
-/// An intro/outro range in seconds.
+/// An intro/outro range in seconds
 #[derive(Clone, Copy, Debug)]
 pub struct Segment {
     pub kind: SegmentKind,
@@ -566,12 +633,12 @@ pub struct Segment {
 }
 
 impl Client {
-    /// Same image endpoint, constrained by width (for 16:9 thumbnails).
+    /// Same image endpoint, constrained by width (for 16:9 thumbnails)
     pub fn image_url_w(&self, id: &str, kind: &str, max_width: u32) -> String {
         format!("{}/Items/{id}/Images/{kind}?maxWidth={max_width}&quality=90", self.base)
     }
 
-    /// Horizontal artwork for an item: episode thumbnail, else Thumb/Backdrop.
+    /// Horizontal artwork for an item: episode thumbnail, else Thumb/Backdrop
     pub fn thumb_url(&self, item: &Item, max_width: u32) -> String {
         if item.is_episode() {
             if item.image_tags.contains_key("Primary") {
@@ -597,7 +664,7 @@ impl Client {
     }
 
     /// Intro/outro ranges. Prefers Jellyfin's native Media Segments API (10.10+, which the
-    /// Intro Skipper plugin populates), then falls back to the plugin's own endpoints.
+    /// Intro Skipper plugin populates), then falls back to the plugin's own endpoints
     pub fn segments(&self, item: &Item) -> Vec<Segment> {
         let mut out: Vec<Segment> = Vec::new();
         let has = |out: &Vec<Segment>, k: SegmentKind| out.iter().any(|s| s.kind == k);
@@ -678,7 +745,7 @@ impl Client {
         out
     }
 
-    /// Seasons of a series, in order.
+    /// Seasons of a series, in order
     pub fn seasons(&self, series_id: &str) -> Vec<Item> {
         let path = format!("/Shows/{series_id}/Seasons?UserId={}&EnableImages=false&EnableUserData=false&Fields=ChildCount", self.user_id);
         self.get(&path)
@@ -688,7 +755,7 @@ impl Client {
             .unwrap_or_default()
     }
 
-    /// Episodes of one season, with summaries and watch progress.
+    /// Episodes of one season, with summaries and watch progress
     pub fn season_episodes(&self, series_id: &str, season_id: &str) -> Vec<Item> {
         let path = format!(
             "/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Fields={}",
@@ -702,7 +769,7 @@ impl Client {
             .unwrap_or_default()
     }
 
-    /// (previous, next) episode around `item` across the whole series.
+    /// (previous, next) episode around `item` across the whole series
     pub fn adjacent_episodes(&self, item: &Item) -> (Option<Item>, Option<Item>) {
         let Some(series) = item.series_id.as_deref().filter(|_| item.is_episode()) else { return (None, None) };
         let path = format!("/Shows/{series}/Episodes?UserId={}&EnableImages=false", self.user_id);
@@ -715,26 +782,10 @@ impl Client {
         let next = items.get(i + 1).cloned();
         (prev, next)
     }
-
-    /// The episode after `item` in its series, if any.
-    pub fn next_episode(&self, item: &Item) -> Option<Item> {
-        if !item.is_episode() {
-            return None;
-        }
-        let series = item.series_id.as_deref()?;
-        let path = format!(
-            "/Shows/{series}/Episodes?UserId={}&StartItemId={}&Limit=2&Fields={}",
-            self.user_id,
-            item.id,
-            Self::FIELDS
-        );
-        let items = self.get(&path).ok()?.json::<ItemsResponse>().ok()?.items;
-        items.into_iter().find(|i| i.id != item.id)
-    }
 }
 
 
-/// Classify a chapter title as an intro or outro/credits chapter.
+/// Classify a chapter title as an intro or outro/credits chapter
 fn chapter_kind(name: &str) -> Option<SegmentKind> {
     let lower = name.to_lowercase();
     let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
@@ -779,7 +830,7 @@ impl SortKey {
 }
 
 impl Client {
-    /// The user's libraries, in the order the user set up in Jellyfin (video libraries only).
+    /// The user's libraries, in the order the user set up in Jellyfin (video libraries only)
     pub fn views(&self) -> Vec<Item> {
         self.get(&format!("/Users/{}/Views", self.user_id))
             .ok()
@@ -798,7 +849,7 @@ impl Client {
             .unwrap_or_default()
     }
 
-    /// Next episode to watch for shows the user is part-way through (not already resumable).
+    /// Next episode to watch for shows the user is part-way through (when not in-progress with an episode)
     pub fn next_up_items(&self, limit: u32) -> Vec<Item> {
         let path = format!(
             "/Shows/NextUp?UserId={}&Limit={limit}&Fields={}&EnableResumable=false&EnableImageTypes=Primary,Backdrop,Logo,Thumb",
@@ -933,21 +984,67 @@ impl Client {
         SearchResults { titles, episodes, people }
     }
 
-    /// Movies and shows a person appears in.
+    /// Movies and shows a person appears in
     pub fn person_titles(&self, person_id: &str) -> Vec<Item> {
-        self.items(&format!(
-            "/Users/{}/Items?PersonIds={person_id}&Recursive=true&IncludeItemTypes=Movie,Series&SortBy=ProductionYear,SortName&SortOrder=Descending&Fields={}&ImageTypeLimit=1&EnableImageTypes=Primary",
+        let mut v = self.items(&format!(
+            "/Users/{}/Items?PersonIds={person_id}&Recursive=true&IncludeItemTypes=Movie,Series&SortBy=ProductionYear,SortName&SortOrder=Descending&Fields={},People&ImageTypeLimit=1&EnableImageTypes=Primary",
             self.user_id,
             Self::FIELDS
-        ))
+        ));
+        for i in v.iter_mut() {
+            i.role = i.people.iter().find(|p| p.id == person_id).and_then(|p| p.role.clone()).filter(|r| !r.trim().is_empty());
+            i.people.clear();
+        }
+        v
     }
 
-    /// Extras (behind the scenes, creditless OP/ED...) attached to a movie, show or season.
-    pub fn extras(&self, id: &str) -> Vec<Item> {
-        self.get(&format!("/Users/{}/Items/{id}/SpecialFeatures", self.user_id))
+    /// Extras (behind the scenes, creditless OP/ED...) attached to a movie, show or season
+    pub fn extras(&self, id: &str, owner: &str, owner_logo: bool) -> Vec<Item> {
+        let mut v = self
+            .get(&format!("/Users/{}/Items/{id}/SpecialFeatures", self.user_id))
             .ok()
             .and_then(|r| r.json::<Vec<Item>>().ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for i in v.iter_mut() {
+            i.owner = Some((owner.to_string(), owner_logo));
+        }
+        v
+    }
+
+    /// Trickplay (scrub preview) metadata for the item being played, if the server generated it
+    pub fn trickplay(&self, item_id: &str, media_source_id: &str) -> Option<Trick> {
+        let v: Value = self.get(&format!("/Users/{}/Items/{item_id}", self.user_id)).ok()?.json().ok()?;
+        let map = v["Trickplay"].get(media_source_id).or_else(|| v["Trickplay"].as_object()?.values().next())?;
+        let (w, info) = map
+            .as_object()?
+            .iter()
+            .filter_map(|(k, v)| Some((k.parse::<u32>().ok()?, v)))
+            .min_by_key(|(w, _)| (*w as i64 - 320).abs())?;
+        let g = |k: &str| info[k].as_u64().unwrap_or(0);
+        let t = Trick {
+            item_id: item_id.to_string(),
+            media_source_id: media_source_id.to_string(),
+            width: w,
+            thumb_w: g("Width") as u32,
+            thumb_h: g("Height") as u32,
+            tile_w: g("TileWidth").max(1) as u32,
+            tile_h: g("TileHeight").max(1) as u32,
+            count: g("ThumbnailCount") as u32,
+            interval_ms: g("Interval").max(1),
+        };
+        (t.thumb_w > 0 && t.thumb_h > 0 && t.count > 0).then_some(t)
+    }
+
+    /// Download and decode one trickplay tile sheet
+    pub fn trickplay_tile(&self, t: &Trick, index: u32) -> Option<eframe::egui::ColorImage> {
+        let bytes = self
+            .get(&format!("/Videos/{}/Trickplay/{}/{index}.jpg?MediaSourceId={}", t.item_id, t.width, t.media_source_id))
+            .ok()?
+            .bytes()
+            .ok()?;
+        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let size = [img.width() as usize, img.height() as usize];
+        Some(eframe::egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
     }
 
     pub fn item_detail(&self, id: &str) -> Result<Item> {
@@ -973,29 +1070,48 @@ impl Client {
                 _ => (None, vec![]),
             };
             let next_ep = series.as_deref().and_then(|s| self.episode_for_series(s).ok());
-            return Ok(TitleData { item, next_ep, similar: vec![], seasons: vec![], season_id, episodes, series_extras: vec![], season_extras: vec![] });
+            return Ok(TitleData { item, next_ep, similar: vec![], seasons: vec![], season_id, episodes, series_extras: vec![], season_extras: vec![], focus: None });
         }
-        let series_extras = self.extras(&item.id);
+        let series_extras = self.extras(&item.id, &item.id, item.image_tags.contains_key("Logo"));
         let similar = self.similar(&item.id);
         if item.kind != "Series" {
-            return Ok(TitleData { item, next_ep: None, similar, seasons: vec![], season_id: None, episodes: vec![], series_extras, season_extras: vec![] });
+            return Ok(TitleData { item, next_ep: None, similar, seasons: vec![], season_id: None, episodes: vec![], series_extras, season_extras: vec![], focus: None });
         }
         let seasons = self.seasons(&item.id);
         store_count(&item.id, count_from_seasons(&seasons));
-        let first = seasons
-            .iter()
-            .filter(|s| s.index_number != Some(0))
-            .min_by_key(|s| s.index_number.unwrap_or(u32::MAX))
+        // open on the season of the last episode watched; fresh shows start on their first real season
+        let last = self.last_watched(&item.id);
+        let first = last
+            .as_ref()
+            .and_then(|e| e.season_id.as_ref())
+            .and_then(|sid| seasons.iter().find(|s| &s.id == sid))
+            .or_else(|| {
+                seasons
+                    .iter()
+                    .filter(|s| s.index_number != Some(0))
+                    .min_by_key(|s| s.index_number.unwrap_or(u32::MAX))
+            })
             .or_else(|| seasons.first());
         let (season_id, episodes, season_extras) = match first {
-            Some(s) => (Some(s.id.clone()), self.season_episodes(&item.id, &s.id), self.extras(&s.id)),
+            Some(s) => (Some(s.id.clone()), self.season_episodes(&item.id, &s.id), self.extras(&s.id, &item.id, item.image_tags.contains_key("Logo"))),
             None => (None, vec![], vec![]),
         };
+        let focus = last.map(|e| e.id);
         let next_ep = self.episode_for_series(&item.id).ok();
-        Ok(TitleData { item, next_ep, similar, seasons, season_id, episodes, series_extras, season_extras })
+        Ok(TitleData { item, next_ep, similar, seasons, season_id, episodes, series_extras, season_extras, focus })
     }
 
-    /// Jellyfin's "more like this" suggestions.
+    /// The furthest episode (by season, then number) that has been watched or started
+    fn last_watched(&self, series_id: &str) -> Option<Item> {
+        let path = format!("/Shows/{series_id}/Episodes?UserId={}&Fields=SpecialEpisodeNumbers,RunTimeTicks", self.user_id);
+        let items = self.get(&path).ok()?.json::<ItemsResponse>().ok()?.items;
+        items
+            .into_iter()
+            .filter(|e| e.played() || e.resume_seconds() > 1.0)
+            .max_by_key(|e| (e.parent_index_number.unwrap_or(0), e.index_number.unwrap_or(0)))
+    }
+
+    /// Jellyfin's "more like this" suggestions
     pub fn similar(&self, id: &str) -> Vec<Item> {
         self.items(&format!("/Items/{id}/Similar?userId={}&limit=14&Fields={}&ImageTypeLimit=1&EnableImageTypes=Primary", self.user_id, Self::FIELDS))
     }
@@ -1010,7 +1126,7 @@ impl Client {
             .unwrap_or_default()
     }
 
-    /// Episode count of a show, specials excluded.
+    /// Episode count of a show, specials excluded
     pub fn fetch_episode_count(&self, series_id: &str) -> Option<u32> {
         count_from_seasons(&self.seasons(series_id))
     }
@@ -1037,7 +1153,7 @@ fn counts() -> &'static std::sync::Mutex<Counts> {
     C.get_or_init(Default::default)
 }
 
-/// Cached episode count; queues a background fetch the first time a show is asked about.
+/// Cached episode count; queues a background fetch the first time a show is asked about
 pub fn ep_count(id: &str) -> Option<u32> {
     let mut c = counts().lock().ok()?;
     if let Some(n) = c.done.get(id) {
@@ -1061,7 +1177,7 @@ pub fn store_count(id: &str, n: Option<u32>) {
 }
 
 impl Client {
-    /// After toggling watched state: fresh detail, next episode and the shown season's episodes.
+    /// After toggling watched state: fresh detail, next episode and the shown season's episodes
     pub fn refresh_title(&self, id: &str, series_id: Option<&str>, season_id: Option<&str>) -> Result<(Item, Option<Item>, Vec<Item>)> {
         let item = self.item_detail(id)?;
         let series = series_id.unwrap_or(id);
@@ -1102,6 +1218,7 @@ fn squash(s: &str) -> String {
 
 /// Every query word must occur somewhere in the name, ignoring punctuation and spacing
 /// ("steins gate 0" finds "Steins;Gate 0").
+/// Btw, you should watch that if you see this.
 fn name_matches(name: &str, q: &[String]) -> bool {
     let n = squash(name);
     q.iter().all(|t| n.contains(t.as_str()))
