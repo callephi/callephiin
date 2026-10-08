@@ -32,6 +32,27 @@ The latest builds for Windows can be found on the [Releases page](https://github
 
 You need to source your own `libmpv-2.dll` and place it beside `callephiin.exe`. You can download any `mpv-dev-x86_64-*` archive from [SourceForge](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/).
 
+## Stack
+**UI & Video:** 
+- [egui](https://github.com/emilk/egui) and [eframe](https://github.com/emilk/egui/tree/main/crates/eframe) with `egui_extras`
+- [resvg](https://github.com/linebender/resvg) for rendering callephiin logo
+- [image](https://github.com/image-rs/image)
+- [mpv](https://github.com/mpv-player/mpv) via `libmpv2`
+
+**Data & Networking:** 
+- [serde](https://github.com/serde-rs/serde)
+- [uuid](https://github.com/uuid-rs/uuid)
+- [chrono](https://github.com/chronotope/chrono)
+- [reqwest](https://github.com/seanmonstar/reqwest) for networking
+
+**Misc:** 
+- [discord-rich-presence](https://docs.rs/discord-rich-presence/latest/discord_rich_presence/)
+- [anyhow](https://github.com/dtolnay/anyhow)
+- [log](https://github.com/rust-lang/log)
+- [env_logger](https://github.com/rust-cli/env_logger)
+- [webbrowser](https://github.com/amodm/webbrowser-rs)
+- [winresource](https://github.com/BenjaminRi/winresource)
+
 ## Building
 Install [Rust's MSVC toolchain](https://rustup.rs), accepting the options as they appear in the installer.
 
