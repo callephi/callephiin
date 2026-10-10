@@ -14,16 +14,15 @@ This project is strictly personal and completely vibecode slop. The only human-m
 ## Key Features
 - MPV backend for video playback with cohesive handling of audio/subtitle tracks
 - Discord Presence
+- Sonarr integration
 - IntroSkipper support
+- Trickplay support
 - Multiple profiles & servers
 - Spoiler Protection option (disabled by default)
 - Custom interface sizing (automatic by default)
 - More to be worked on:
-  - Nice animations
-  - Better handling of missing metadata
   - More detailed Settings page
   - Improved compatibility for external/sidecar files
-  - TrickPlay support
   - Support for Apple Silicon
   - Some more fun stuff
 
