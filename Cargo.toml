@@ -1,6 +1,6 @@
 [package]
 name = "callephiin"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 description = "callephiin, a Windows-native Jellyfin desktop client"
 
@@ -21,7 +21,6 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
-env_logger = "0.11"
 webbrowser = "1"
 
 [profile.release]
@@ -31,3 +30,7 @@ opt-level = 3
 
 [build-dependencies]
 winresource = "0.1"
+
+# libmpv2 with a non-blocking render() (see the comment in vendor/libmpv2/src/mpv/render.rs)
+[patch.crates-io]
+libmpv2 = { path = "vendor/libmpv2" }
