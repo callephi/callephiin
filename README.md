@@ -49,7 +49,6 @@ You need to source your own `libmpv-2.dll` and place it beside `callephiin.exe`.
 - [discord-rich-presence](https://docs.rs/discord-rich-presence/latest/discord_rich_presence/)
 - [anyhow](https://github.com/dtolnay/anyhow)
 - [log](https://github.com/rust-lang/log)
-- [env_logger](https://github.com/rust-cli/env_logger)
 - [webbrowser](https://github.com/amodm/webbrowser-rs)
 - [winresource](https://github.com/BenjaminRi/winresource)
 
