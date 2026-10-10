@@ -1,5 +1,6 @@
 mod pages;
 mod profiles;
+use crate::debuglog::LogOk;
 use profiles::View;
 use pages::{Detail, SearchState};
 use crate::config::{Config, SeriesTracks, StoredTrack, StreamMode};
@@ -34,6 +35,10 @@ enum Msg {
     /// One page of a library (`req` identifies the request so stale answers are dropped)
     Library { req: u64, result: Result<(Vec<Item>, usize), String> },
     Title { req: u64, result: Result<TitleData, String> },
+    Sonarr { req: u64, info: Option<crate::sonarr::Info> },
+    /// Full details of the highlighted home item (its list entry had no artwork info)
+    Enriched(Item),
+    SonarrTest(Result<String, String>),
     TitleSeason { req: u64, season_id: String, episodes: Vec<Item>, extras: Vec<Item> },
     Person { req: u64, items: Vec<Item> },
     TitleRefresh { req: u64, item: Item, next: Option<Item>, episodes: Vec<Item> },
@@ -96,6 +101,10 @@ pub struct App {
     scroll_reset: bool,
     custom_scale_text: String,
     selected: Option<Item>,
+    /// Result of the last Sonarr "Test" press (None while untested or testing)
+    sonarr_test: Option<Result<String, String>>,
+    /// Items already re-fetched because the hero had no artwork
+    enriched: std::collections::HashSet<String>,
     status: String,
     busy: bool,
 
@@ -113,6 +122,9 @@ pub struct App {
     player: Option<Player>,
     player_error: Option<String>,
     controls_until: Instant,
+    /// Which skip segment the button was last shown for, and since when
+    skip_key: Option<u64>,
+    skip_since: Instant,
     seek_drag: Option<f64>,
     last_progress: Instant,
 
@@ -153,6 +165,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        cc.egui_ctx.add_bytes_loader(Arc::new(crate::imgloader::LoggingHttp::new()));
         apply_theme(&cc.egui_ctx);
 
         let cfg = Config::load();
@@ -193,6 +206,8 @@ impl App {
             scroll_reset: false,
             custom_scale_text: String::new(),
             selected: None,
+            sonarr_test: None,
+            enriched: Default::default(),
             status: String::new(),
             busy: false,
             password: String::new(),
@@ -206,6 +221,8 @@ impl App {
             player,
             player_error,
             controls_until: Instant::now(),
+            skip_key: None,
+            skip_since: Instant::now(),
             seek_drag: None,
             last_progress: Instant::now(),
             segments: vec![],
@@ -292,7 +309,7 @@ impl App {
         self.next_up.retain(|i| i.id != item.id);
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let _ = client.mark_played(&item.id);
+            crate::logged!(client.mark_played(&item.id));
             let _ = tx.send(Self::home_msg(&client));
             ctx.request_repaint();
         });
@@ -319,7 +336,12 @@ impl App {
         self.status = format!("Loading {}…", item.display_title());
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<PlayInfo> {
-                let target = if item.kind == "Series" { client.episode_for_series(&item.id)? } else { item };
+                let mut target = if item.kind == "Series" { client.episode_for_series(&item.id)? } else { item };
+                // no version chosen (Home, Play button): continue the version watched last
+                if target.source.is_none() {
+                    let last = cfg.version_mem(&target.id).last;
+                    target.source = Some(last).filter(|l| !l.is_empty());
+                }
                 client.play_info(&target, &cfg)
             })()
             .map_err(|e| format!("{e:#}"));
@@ -333,6 +355,10 @@ impl App {
         if let (Some(p), Some(client)) = (self.player.as_ref(), self.client.clone()) {
             if let Some(info) = p.current.clone() {
                 let pos = p.position();
+                if info.versions > 1 {
+                    self.cfg.remember_stop(&info.item.id, &info.media_source_id, pos, info.item.run_time_ticks.unwrap_or(0) as f64 / 1e7);
+                    self.cfg.save();
+                }
                 std::thread::spawn(move || client.report_stopped(&info, pos));
             }
         }
@@ -371,28 +397,38 @@ impl App {
                 });
             }
         }
-        let text = match label {
-            Some(l) => format!("{}  ·  {}", ui::fmt_time(t), l),
-            None => ui::fmt_time(t),
-        };
-        let w = thumb.map(|(_, _, sz)| sz.x).unwrap_or(0.0).max(90.0);
-        let h = thumb.map(|(_, _, sz)| sz.y + 6.0).unwrap_or(0.0) + 28.0;
+        // line 1: timestamp; line 2: chapter title (or Intro / Credits marker)
+        let chapter = self.chapters.iter().rev().find(|c| c.1 <= t + 0.5).map(|c| c.0.trim().to_string()).filter(|n| !n.is_empty());
+        let sub = chapter.or_else(|| label.map(str::to_string));
+        let (tfont, sfont) = (egui::FontId::monospace(15.0), egui::FontId::proportional(13.0));
+        let time_text = ui::fmt_time(t);
+        let (tw, sw) = ctx.fonts(|f| {
+            (
+                f.layout_no_wrap(time_text.clone(), tfont.clone(), Color32::WHITE).size().x,
+                sub.as_ref().map_or(0.0, |s| f.layout_no_wrap(s.clone(), sfont.clone(), Color32::WHITE).size().x),
+            )
+        });
+        let w = thumb.map(|(_, _, sz)| sz.x).unwrap_or(0.0).max(tw.max(sw) + 24.0).max(90.0);
+        let h = thumb.map(|(_, _, sz)| sz.y + 6.0).unwrap_or(0.0) + 12.0 + 20.0 + if sub.is_some() { 20.0 } else { 0.0 }; // 6px padding top and bottom
         let screen = ctx.screen_rect();
         let px = (x - w / 2.0).clamp(screen.left() + 8.0, (screen.right() - w - 8.0).max(8.0));
         egui::Area::new("seek_popup".into())
-            .fixed_pos(pos2(px, top - h - 10.0))
+            .fixed_pos(pos2(px, top - h - 14.0))
             .order(egui::Order::Tooltip)
             .interactable(false)
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
                 ui.painter().rect_filled(rect.expand(4.0), 8.0, Color32::from_rgba_unmultiplied(12, 14, 20, 235));
-                let mut y = rect.top();
+                let mut y = rect.top() + 6.0;
                 if let Some((id, uv, sz)) = thumb {
                     let img = Rect::from_min_size(pos2(rect.center().x - sz.x / 2.0, y), sz);
                     egui::Image::new(egui::load::SizedTexture::new(id, sz)).uv(uv).rounding(5.0).paint_at(ui, img);
                     y += sz.y + 6.0;
                 }
-                ui.painter().text(pos2(rect.center().x, y + 14.0), egui::Align2::CENTER_CENTER, text, egui::FontId::monospace(15.0), Color32::WHITE);
+                ui.painter().text(pos2(rect.center().x, y + 10.0), egui::Align2::CENTER_CENTER, time_text, tfont, Color32::WHITE);
+                if let Some(sub) = sub {
+                    ui.painter().text(pos2(rect.center().x, y + 30.0), egui::Align2::CENTER_CENTER, sub, sfont, Color32::from_gray(200));
+                }
             });
     }
 
@@ -404,6 +440,10 @@ impl App {
         if let (Some(p), Some(client)) = (self.player.as_mut(), self.client.clone()) {
             if let Some(info) = p.current.clone() {
                 let pos = p.position();
+                if info.versions > 1 {
+                    self.cfg.remember_stop(&info.item.id, &info.media_source_id, pos, info.item.run_time_ticks.unwrap_or(0) as f64 / 1e7);
+                    self.cfg.save();
+                }
                 std::thread::spawn(move || client.report_stopped(&info, pos));
             }
             p.stop();
@@ -419,13 +459,13 @@ impl App {
         self.season_menu = false;
         self.window_title = "callephiin".to_string();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title.clone()));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        set_fullscreen(ctx, false);
         self.refresh_home(ctx);
     }
 
     fn open_dashboard(&self) {
         let url = format!("{}/web/#/dashboard", self.cfg.server_url.trim_end_matches('/'));
-        let _ = webbrowser::open(&url);
+        crate::logged!(webbrowser::open(&url));
     }
 
     fn poll_messages(&mut self, ctx: &egui::Context) {
@@ -445,6 +485,7 @@ impl App {
                     self.refresh_home(ctx);
                 }
                 Msg::Login(Err(e)) => {
+                    log::warn!("login failed: {e}");
                     self.busy = false;
                     self.status = e;
                 }
@@ -478,17 +519,42 @@ impl App {
                                     v.total = total;
                                     v.error = None;
                                 }
-                                Err(e) => v.error = Some(e),
+                                Err(e) => {
+                                    log::warn!("library load failed: {e}");
+                                    v.error = Some(e);
+                                }
                             }
                         }
                     }
                 }
-                Msg::Title { req, result } => self.on_title_loaded(req, result),
+                Msg::Title { req, result } => self.on_title_loaded(req, result, ctx),
+                Msg::Sonarr { req, info } => {
+                    for d in self.detail.iter_mut() {
+                        if let Detail::Title(v) = d {
+                            if v.req == req {
+                                v.sonarr = info.clone();
+                            }
+                        }
+                    }
+                }
+                Msg::Enriched(item) => {
+                    if self.selected.as_ref().map_or(false, |s| s.id == item.id) {
+                        self.selected = Some(item);
+                    }
+                }
+                Msg::SonarrTest(r) => {
+                    match &r {
+                        Ok(m) => log::debug!("sonarr test: {m}"),
+                        Err(e) => log::warn!("sonarr test failed: {e}"),
+                    }
+                    self.sonarr_test = Some(r);
+                }
                 Msg::TitleSeason { req, season_id, episodes, extras } => self.on_title_season(req, season_id, episodes, extras),
                 Msg::TitleRefresh { req, item, next, episodes } => self.on_title_refresh(req, item, next, episodes),
                 Msg::Person { req, items } => self.on_person_loaded(req, items),
                 Msg::Search { req, query, results } => self.on_search(req, query, results),
                 Msg::Error(e) => {
+                    log::warn!("{e}");
                     self.busy = false;
                     if e.contains("401") {
                         // session expired: sign in again (profile name / server / user are kept)
@@ -549,7 +615,10 @@ impl App {
                         self.status = "Player unavailable (libmpv failed to load)".into();
                     }
                 }
-                Msg::Play(Err(e)) => self.status = format!("Playback failed: {e}"),
+                Msg::Play(Err(e)) => {
+                    log::warn!("playback failed: {e}");
+                    self.status = format!("Playback failed: {e}");
+                }
                 Msg::Tile { item_id, index, image } => {
                     self.trick_pending.remove(&index);
                     if self.current_item().map(|i| i.id).as_deref() == Some(item_id.as_str()) {
@@ -586,6 +655,16 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // remember the normal window geometry (not maximized, not "fullscreen") for set_fullscreen
+        if !is_fullscreen(ctx) {
+            let (outer, inner, maxed, min) = ctx.input(|i| {
+                let v = i.viewport();
+                (v.outer_rect, v.inner_rect, v.maximized.unwrap_or(false), v.minimized.unwrap_or(false))
+            });
+            if let (Some(o), Some(inn), false, false) = (outer, inner, maxed, min) {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("bl_normal"), (o.min, inn.size())));
+            }
+        }
         self.poll_messages(ctx);
 
         // wheel scrolling is a bit more sensitive than egui's default
@@ -593,7 +672,10 @@ impl eframe::App for App {
 
         // Scrollbars are invisible unless the user is scrolling (wheel / touchpad) or dragging one.
         let scrolling = ctx.input(|i| i.raw_scroll_delta != egui::Vec2::ZERO || i.smooth_scroll_delta != egui::Vec2::ZERO);
-        if scrolling {
+        // also keep them visible while the pointer is held down (dragging a bar) or over the right edge
+        let right_edge = ctx.screen_rect().right() - 26.0; // read outside ctx.input: nesting it can deadlock
+        let (held, at_edge) = ctx.input(|i| (i.pointer.any_down(), i.pointer.latest_pos().map_or(false, |p| p.x > right_edge)));
+        if scrolling || held || at_edge {
             self.scroll_seen = Instant::now();
         }
         let recent = self.scroll_seen.elapsed() < Duration::from_millis(900);
@@ -694,7 +776,7 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::symmetric(28.0 * s, 22.0 * s)))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::symmetric(ui::PAGE_MX * s, ui::PAGE_MY * s)))
             .show(ctx, |ui| {
                 ui::scale_style(ui, s);
                 match self.tab {
@@ -802,6 +884,22 @@ impl App {
         if let Some(h) = hover {
             self.selected = Some(h);
         }
+        // a highlighted title whose list entry carried no backdrop info: fetch the full item once
+        if let Some(sel) = &self.selected {
+            let bare = sel.backdrop_image_tags.is_empty()
+                && sel.parent_backdrop_image_tags.is_empty()
+                && !(sel.is_episode() && sel.image_tags.contains_key("Primary"));
+            if bare && self.enriched.insert(sel.id.clone()) {
+                log::debug!("hero item {} ({}) came without backdrop info (kind {}, image tags {:?}); fetching details", sel.name, sel.id, sel.kind, sel.image_tags.keys().collect::<Vec<_>>());
+                let (id, client, tx, ctx) = (sel.id.clone(), client.clone(), self.tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    if let Some(item) = client.item_detail(&id).log_ok() {
+                        let _ = tx.send(Msg::Enriched(item));
+                        ctx.request_repaint();
+                    }
+                });
+            }
+        }
         if let Some(lib) = open_lib {
             self.open_library(lib, ctx);
         }
@@ -868,11 +966,12 @@ impl App {
         }
         area.show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("<  Back").clicked() {
+                if ui::icon_button(ui, Icon::Back, 40.0 * s, true).clicked() {
                     back = true;
                 }
                 ui.label(RichText::new(&name).size(26.0 * s).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(18.0 * s); // keep clear of the scrollbar
                     egui::ComboBox::from_id_salt("library_page_size")
                         .selected_text(format!("{size} per page"))
                         .show_ui(ui, |ui| {
@@ -964,7 +1063,7 @@ impl App {
                 c.ui_scale_custom,
                 c.use_file_default_tracks,
                 c.remember_tracks,
-                (c.external_tracks, c.skip_back_secs, c.skip_fwd_secs, c.spoiler_control, c.switcher_on_launch),
+                (c.external_tracks, c.skip_back_secs, c.skip_fwd_secs, c.spoiler_control, c.switcher_on_launch, c.debug_log, c.sonarr_url.clone(), c.sonarr_key.clone()),
             )
         };
         let before = snapshot(&self.cfg);
@@ -1093,6 +1192,41 @@ impl App {
                 ui.checkbox(&mut self.cfg.discord_enabled, "Enable Discord Presence");
             });
 
+            ui::section(ui, "Sonarr", s, |ui| {
+                ui.label(RichText::new("Shows when the next episode of a series airs.").color(MUTED));
+                ui.add_space(4.0 * s);
+                ui.horizontal(|ui| {
+                    ui.add_sized(vec2(70.0 * s, 20.0 * s), egui::Label::new("Address"));
+                    ui.add(egui::TextEdit::singleline(&mut self.cfg.sonarr_url).hint_text(RichText::new("http://192.168.1.10:8989").color(Color32::from_gray(85))).desired_width(300.0 * s));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized(vec2(70.0 * s, 20.0 * s), egui::Label::new("API key"));
+                    ui.add(egui::TextEdit::singleline(&mut self.cfg.sonarr_key).hint_text(RichText::new("Sonarr API key").color(Color32::from_gray(85))).password(true).desired_width(300.0 * s));
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Test").clicked() {
+                        self.sonarr_test = None;
+                        let (url, key, tx, ctx) = (self.cfg.sonarr_url.clone(), self.cfg.sonarr_key.clone(), self.tx.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            let _ = tx.send(Msg::SonarrTest(crate::sonarr::test(&url, &key)));
+                            ctx.request_repaint();
+                        });
+                    }
+                    if ui.button("Save").clicked() {
+                        self.cfg.sonarr_url = self.cfg.sonarr_url.trim().to_string();
+                        self.cfg.sonarr_key = self.cfg.sonarr_key.trim().to_string();
+                        self.cfg.save();
+                        self.sonarr_test = Some(Ok("Saved".into()));
+                    }
+                    match &self.sonarr_test {
+                        Some(Ok(m)) => ui.colored_label(Color32::from_rgb(110, 200, 130), m),
+                        Some(Err(e)) => ui.colored_label(Color32::LIGHT_RED, e),
+                        None => ui.label(""),
+                    };
+                });
+            });
+            ui.add_space(18.0 * s);
+
             ui::section(ui, "Account", s, |ui| {
                 let ver = if self.server_version.is_empty() { String::new() } else { format!(" | v{}", self.server_version) };
                 ui.label(format!("{} @ {}{ver}", self.cfg.username, self.cfg.server_url));
@@ -1108,6 +1242,14 @@ impl App {
                 ui.checkbox(&mut self.cfg.switcher_on_launch, "Always show the profile switcher at launch");
             });
             ui.add_space(18.0 * s);
+            ui::section(ui, "Diagnostics", s, |ui| {
+                if ui.checkbox(&mut self.cfg.debug_log, "Enable debug log output").changed() {
+                    crate::debuglog::set_enabled(self.cfg.debug_log);
+                }
+                if let Some(p) = crate::debuglog::path() {
+                    ui.label(RichText::new(format!("Output folder: {}", p.parent().unwrap_or(&p).display())).small().color(MUTED));
+                }
+            });
             ui.hyperlink_to(format!("callephiin v{} | developed by callephi", env!("CARGO_PKG_VERSION")), "https://github.com/callephi/callephiin");
             ui.add_space(12.0 * s);
         });
@@ -1278,7 +1420,7 @@ impl App {
         if !self.started && self.tracks_applied && (self.meta_ready || waited > Duration::from_secs(6)) {
             self.started = true;
             if !self.user_hold {
-                let _ = player.mpv.set_property("pause", false);
+                crate::logged!(player.mpv.set_property("pause", false));
             }
         }
 
@@ -1302,16 +1444,16 @@ impl App {
                 i.key_pressed(egui::Key::F),
             )
         });
-        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let fullscreen = is_fullscreen(ctx);
         if space { toggle_play(player, self.started, &mut self.user_hold); }
         if left { player.seek_by(-(self.cfg.skip_back_secs as f64)); }
         if right { player.seek_by(self.cfg.skip_fwd_secs as f64); }
-        if f_key { ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen)); }
+        if f_key { set_fullscreen(ctx, !fullscreen); }
         if esc {
             if self.panel_open {
                 act.toggle_panel = true;
             } else if fullscreen {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                set_fullscreen(ctx, false);
             } else {
                 act.back = true;
             }
@@ -1335,7 +1477,7 @@ impl App {
                     gl.color_mask(true, true, true, true);
                 }
                 if let Ok(r) = render.lock() {
-                    let _ = r.0.render::<()>(0, w as i32, h as i32, true);
+                    crate::logged!(r.0.render::<()>(0, w as i32, h as i32, true));
                 }
                 unsafe {
                     // force the alpha channel opaque so the compositor never shows the video see-through
@@ -1349,7 +1491,7 @@ impl App {
             ui.painter().add(egui::PaintCallback { rect: screen, callback: Arc::new(cb) });
             let resp = ui.allocate_rect(screen, Sense::click());
             if resp.double_clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+                set_fullscreen(ctx, !fullscreen);
             } else if resp.clicked() {
                 toggle_play(player, self.started, &mut self.user_hold);
             }
@@ -1370,7 +1512,18 @@ impl App {
         if active.is_some() {
             self.last_skip = active;
         }
-        let fade = ctx.animate_bool_with_time(egui::Id::new("skip_fade"), active.is_some(), 0.4);
+        // the button shows for a few seconds when its segment starts, then only while the controls are up
+        let seg_key = match active {
+            Some(Skip::Intro(e)) => Some(e.to_bits()),
+            Some(Skip::Next) => Some(1),
+            None => None,
+        };
+        if seg_key != self.skip_key {
+            self.skip_key = seg_key;
+            self.skip_since = Instant::now();
+        }
+        let skip_visible = active.is_some() && (show_controls || self.skip_since.elapsed() < Duration::from_secs(5));
+        let fade = ctx.animate_bool_with_time(egui::Id::new("skip_fade"), skip_visible, 0.4);
         if fade > 0.0 {
             if let Some(sk) = self.last_skip {
                 let label = match sk {
@@ -1383,7 +1536,7 @@ impl App {
                 egui::Area::new("skip_btn".into())
                     .fixed_pos(pos2(screen.right() - 48.0 - panel_w - 200.0, y))
                     .order(egui::Order::Foreground)
-                    .interactable(active.is_some())
+                    .interactable(skip_visible)
                     .show(ctx, |ui| {
                         let fill = Color32::from_rgba_unmultiplied(240, 240, 240, alpha);
                         let text = Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
@@ -1437,12 +1590,21 @@ impl App {
                 ui.allocate_new_ui(UiBuilder::new().max_rect(logo_rect).layout(Layout::right_to_left(Align::TOP)), |ui| {
                     match (&logo_url, has_logo) {
                         (Some(url), true) => {
-                            let r = ui.add(egui::Image::new(url.as_str()).max_height(120.0).max_width(520.0).show_loading_spinner(false).sense(Sense::click()));
-                            if r.hovered() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            }
-                            if r.clicked() {
-                                act.open_series = Some(if item.is_episode() || item.owner.is_some() { item.series_stub() } else { item.clone() });
+                            let img = egui::Image::new(url.as_str()).show_loading_spinner(false);
+                            if let Ok(egui::load::TexturePoll::Ready { texture }) = img.load_for_size(ui.ctx(), vec2(520.0, 120.0)) {
+                                let sz = texture.size;
+                                let k = (120.0 / sz.y).min(520.0 / sz.x).min(1.0);
+                                let size = sz * k;
+                                let rect = Rect::from_min_size(pos2(logo_rect.right() - size.x, logo_rect.top()), size);
+                                ui::paint_logo_shadow(ui, url, rect);
+                                img.paint_at(ui, rect);
+                                let r = ui.interact(rect, egui::Id::new("player_logo"), Sense::click());
+                                if r.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if r.clicked() {
+                                    act.open_series = Some(if item.is_episode() || item.owner.is_some() { item.series_stub() } else { item.clone() });
+                                }
                             }
                         }
                         _ => {
@@ -1485,7 +1647,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Episodes").size(20.0).strong());
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("Close").clicked() {
+                                if ui::cross_button(ui, 34.0).clicked() {
                                     act.toggle_panel = true;
                                 }
                                 if multi_seasons {
@@ -1581,11 +1743,15 @@ impl App {
                     let small = egui::FontId::proportional(13.0);
                     let tint = Color32::from_gray(200);
                     if let Some((name, _)) = self.chapters.iter().rev().find(|c| c.1 <= shown + 0.5).filter(|c| !c.0.trim().is_empty()) {
-                        ui.painter().text(pos2(r.left(), r.top() - 5.0), egui::Align2::LEFT_BOTTOM, name, small.clone(), tint);
+                        let at = pos2(r.left(), r.top() - 5.0);
+                        ui.painter().text(at + vec2(1.5, 1.5), egui::Align2::LEFT_BOTTOM, name, small.clone(), Color32::from_black_alpha(190));
+                        ui.painter().text(at, egui::Align2::LEFT_BOTTOM, name, small.clone(), tint);
                     }
                     if dur > 1.0 {
                         let end = chrono::Local::now() + chrono::Duration::milliseconds(((dur - pos).max(0.0) * 1000.0) as i64);
-                        ui.painter().text(pos2(r.right(), r.top() - 5.0), egui::Align2::RIGHT_BOTTOM, format!("Ends at {}", end.format("%H:%M")), small, tint);
+                        let (at, txt) = (pos2(r.right(), r.top() - 5.0), format!("Ends at {}", end.format("%H:%M")));
+                        ui.painter().text(at + vec2(1.5, 1.5), egui::Align2::RIGHT_BOTTOM, &txt, small.clone(), Color32::from_black_alpha(190));
+                        ui.painter().text(at, egui::Align2::RIGHT_BOTTOM, txt, small, tint);
                     }
                     // explicit layout: [current time] gap [bar] gap [total time], gaps measured from the text itself
                     let (row, _) = ui.allocate_exact_size(vec2(r.width(), 26.0), Sense::hover());
@@ -1676,7 +1842,7 @@ impl App {
                             // rightmost: fullscreen; to its left: episode list
                             let fs_icon = if fullscreen { Icon::ExitFullscreen } else { Icon::Fullscreen };
                             if ui::icon_button(ui, fs_icon, 34.0, true).clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+                                set_fullscreen(ctx, !fullscreen);
                             }
                             if is_episode && ui::icon_button(ui, Icon::Episodes, 34.0, true).clicked() {
                                 act.toggle_panel = true;
@@ -1710,6 +1876,53 @@ impl App {
     }
 }
 
+/// "Fullscreen" is a borderless window the size of the monitor (one pixel row taller, hanging off the bottom edge, so Windows
+/// does not promote it to exclusive fullscreen, which made video flash black on seeks).
+fn is_fullscreen(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<Option<(egui::Rect, bool)>>(egui::Id::new("bl_fs")).map_or(false, |r| r.is_some()))
+}
+
+fn set_fullscreen(ctx: &egui::Context, on: bool) {
+    let id = egui::Id::new("bl_fs");
+    let saved: Option<(egui::Rect, bool)> = ctx.data(|d| d.get_temp::<Option<(egui::Rect, bool)>>(id)).flatten();
+    if on && saved.is_none() {
+        let (outer, mon, maxed) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().monitor_size, i.viewport().maximized.unwrap_or(false)));
+        let (Some(outer), Some(mon)) = (outer, mon) else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            return;
+        };
+        // top-left of the monitor the window is on (monitors assumed equal-sized and tiled)
+        let c = outer.center();
+        let origin = egui::pos2((c.x / mon.x).floor() * mon.x, (c.y / mon.y).floor() * mon.y);
+        // the window's normal (un-maximized) geometry, tracked every frame; it is what un-maximize returns to
+        let normal: Option<(egui::Pos2, egui::Vec2)> = ctx.data(|d| d.get_temp(egui::Id::new("bl_normal")));
+        let normal = normal.map_or(outer, |(p, sz)| egui::Rect::from_min_size(p, sz));
+        ctx.data_mut(|d| d.insert_temp(id, Some((normal, maxed))));
+        if maxed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(origin));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(mon.x, mon.y + 1.0)));
+    } else if !on {
+        if let Some((r, maxed)) = saved {
+            ctx.data_mut(|d| d.insert_temp(id, None::<(egui::Rect, bool)>));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            // always put the normal geometry back first, then maximize on top of it if it was maximized
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(r.size()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(r.min));
+            if maxed {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+    }
+}
+
+/// CJK fallback glyphs sit high next to Latin text; this pushes them down (fraction of font size)
+const CJK_Y_OFFSET: f32 = 0.18;
+
 /// Borrow system's CJK fonts since egui doesn't have built-in JP/KR/CN glyphs
 fn install_cjk_fonts(ctx: &egui::Context) {
     const CANDIDATES: [&str; 14] = [
@@ -1733,7 +1946,7 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     for (i, path) in CANDIDATES.iter().enumerate() {
         if let Ok(bytes) = std::fs::read(path) {
             let name = format!("cjk{i}");
-            fonts.font_data.insert(name.clone(), egui::FontData::from_owned(bytes));
+            fonts.font_data.insert(name.clone(), egui::FontData::from_owned(bytes).tweak(egui::FontTweak { y_offset_factor: CJK_Y_OFFSET, ..Default::default() }));
             for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 fonts.families.entry(fam).or_default().push(name.clone());
             }

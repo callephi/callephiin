@@ -276,16 +276,7 @@ impl App {
 fn corner_cross(ctx: &egui::Context, s: f32) -> bool {
     let mut clicked = false;
     egui::Area::new("corner_close".into()).order(egui::Order::Foreground).fixed_pos(pos2(ctx.screen_rect().right() - 70.0 * s, 24.0 * s)).show(ctx, |ui| {
-        let (r, resp) = ui.allocate_exact_size(vec2(44.0 * s, 44.0 * s), Sense::click());
-        if resp.hovered() {
-            ui.painter().circle_filled(r.center(), 22.0 * s, Color32::from_white_alpha(28));
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let st = Stroke::new(2.4_f32, if resp.hovered() { Color32::WHITE } else { MUTED });
-        let k = 7.0 * s;
-        ui.painter().line_segment([r.center() + vec2(-k, -k), r.center() + vec2(k, k)], st);
-        ui.painter().line_segment([r.center() + vec2(-k, k), r.center() + vec2(k, -k)], st);
-        clicked = resp.clicked();
+        clicked = ui::cross_button(ui, 44.0 * s).clicked();
     });
     clicked
 }

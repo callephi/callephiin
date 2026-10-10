@@ -73,6 +73,11 @@ impl Player {
             init.set_property("sub-margin-y", "36")?;
             // Track language preferences are applied per file in `apply_track_prefs`.
 
+            if cfg.debug_log {
+                if let Some(p) = crate::debuglog::mpv_path() {
+                    init.set_property("log-file", p.to_string_lossy().as_ref())?;
+                }
+            }
             init.set_property("volume", cfg.volume)?;
             // The client draws its own UI.
             init.set_property("osc", "no")?;
@@ -108,45 +113,46 @@ impl Player {
     /// `use_file_defaults`: honour the file's own default / forced flags (no language override)
     pub fn apply_track_prefs(&self, use_file_defaults: bool, sub_langs: &str, audio_langs: &str) {
         if use_file_defaults {
-            let _ = self.mpv.set_property("alang", "");
-            let _ = self.mpv.set_property("slang", "");
+            crate::logged!(self.mpv.set_property("alang", ""));
+            crate::logged!(self.mpv.set_property("slang", ""));
         } else {
-            let _ = self.mpv.set_property("alang", audio_langs);
-            let _ = self.mpv.set_property("slang", sub_langs);
+            crate::logged!(self.mpv.set_property("alang", audio_langs));
+            crate::logged!(self.mpv.set_property("slang", sub_langs));
         }
         // Newer mpv options; ignored if this libmpv doesn't know them.
-        let _ = self.mpv.set_property("subs-fallback", "default");
-        let _ = self.mpv.set_property("subs-fallback-forced", "always");
+        crate::logged!(self.mpv.set_property("subs-fallback", "default"));
+        crate::logged!(self.mpv.set_property("subs-fallback-forced", "always"));
         // Forget a manual choice made on the previous file.
-        let _ = self.mpv.set_property("aid", "auto");
-        let _ = self.mpv.set_property("sid", "auto");
+        crate::logged!(self.mpv.set_property("aid", "auto"));
+        crate::logged!(self.mpv.set_property("sid", "auto"));
     }
 
     pub fn load(&mut self, info: PlayInfo) -> Result<()> {
+        log::debug!("play {} (transcoding: {}, start {:.1}s)", info.item.id, info.transcoding, info.start_seconds);
         if info.start_seconds > 1.0 {
             self.mpv
                 .set_property("start", format!("{:.3}", info.start_seconds).as_str())
                 .map_err(|e| anyhow!("{e:?}"))?;
         } else {
-            let _ = self.mpv.set_property("start", "0");
+            crate::logged!(self.mpv.set_property("start", "0"));
         }
         self.mpv
             .command("loadfile", &[info.url.as_str(), "replace"])
             .map_err(|e| anyhow!("loadfile failed: {e:?}"))?;
         // Start paused: the app applies remembered tracks first, then un-pauses, so the
         // audio / subtitle reinit happens before the picture starts moving.
-        let _ = self.mpv.set_property("pause", true);
+        crate::logged!(self.mpv.set_property("pause", true));
         for (url, title, lang) in &info.external_subs {
-            let _ = self
+            crate::logged!(self
                 .mpv
-                .command("sub-add", &[url.as_str(), "auto", title.as_str(), lang.as_str()]);
+                .command("sub-add", &[url.as_str(), "auto", title.as_str(), lang.as_str()]));
         }
         self.current = Some(info);
         Ok(())
     }
 
     pub fn stop(&mut self) {
-        let _ = self.mpv.command("stop", &[]);
+        crate::logged!(self.mpv.command("stop", &[]));
         self.current = None;
     }
 
@@ -166,20 +172,20 @@ impl Player {
         self.mpv.get_property::<f64>("volume").unwrap_or(100.0)
     }
     pub fn toggle_pause(&self) {
-        let _ = self.mpv.set_property("pause", !self.paused());
+        crate::logged!(self.mpv.set_property("pause", !self.paused()));
     }
     pub fn seek_to(&self, secs: f64) {
-        let _ = self
+        crate::logged!(self
             .mpv
-            .command("seek", &[format!("{secs:.2}").as_str(), "absolute"]);
+            .command("seek", &[format!("{secs:.2}").as_str(), "absolute+exact"]));
     }
     pub fn seek_by(&self, secs: f64) {
-        let _ = self
+        crate::logged!(self
             .mpv
-            .command("seek", &[format!("{secs:.2}").as_str(), "relative"]);
+            .command("seek", &[format!("{secs:.2}").as_str(), "relative"]));
     }
     pub fn set_volume(&self, v: f64) {
-        let _ = self.mpv.set_property("volume", v);
+        crate::logged!(self.mpv.set_property("volume", v));
     }
     /// Audio or subtitle tracks in the currently loaded file
     pub fn tracks(&self, kind: TrackKind) -> Vec<Track> {
@@ -207,16 +213,16 @@ impl Player {
         out
     }
     pub fn set_audio(&self, id: i64) {
-        let _ = self.mpv.set_property("aid", id);
+        crate::logged!(self.mpv.set_property("aid", id));
     }
     /// `None` turns subtitles off, obviously
     pub fn set_sub(&self, id: Option<i64>) {
         match id {
             Some(id) => {
-                let _ = self.mpv.set_property("sid", id);
+                crate::logged!(self.mpv.set_property("sid", id));
             }
             None => {
-                let _ = self.mpv.set_property("sid", "no");
+                crate::logged!(self.mpv.set_property("sid", "no"));
             }
         }
     }

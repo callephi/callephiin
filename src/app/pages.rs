@@ -1,5 +1,6 @@
 //! Search tab, media pages and person pages.
 
+use crate::jellyfin::Client;
 use super::{App, Msg, Tab};
 use crate::jellyfin::{Item, Person, SearchResults, TitleData};
 use crate::ui::{self, TileMode, MUTED};
@@ -32,6 +33,8 @@ pub(super) struct TitleView {
     pub menu: bool,
     /// Episode ID the row should be lined up with once it is drawn
     pub focus: Option<String>,
+    /// Next air date / alternate titles from Sonarr, when configured
+    pub sonarr: Option<crate::sonarr::Info>,
     pub req: u64,
 }
 
@@ -57,6 +60,15 @@ pub(super) struct SearchState {
     pub focus: bool,
     /// The query `results` belongs to
     pub done_for: String,
+}
+
+/// "Version" tiles for a film / episode that exists in several versions
+#[allow(clippy::too_many_arguments)]
+fn versions_row(ui: &mut egui::Ui, client: &Client, item: &Item, mem: &crate::config::VersionMem, s: f32, play: &mut Option<Item>, hover: &mut Option<Item>, open: &mut Option<Item>, watched: &mut Option<Item>, spoil: &ui::Spoiler) {
+    ui.label(RichText::new("Version").size(18.0 * s).strong());
+    ui.add_space(8.0 * s);
+    ui::tile_row(ui, client, &item.version_items(mem), s, "title_versions", TileMode::Version, play, hover, open, watched, spoil);
+    ui.add_space(14.0 * s);
 }
 
 fn pretty_ep(item: &Item, single_season: bool) -> String {
@@ -89,6 +101,7 @@ impl App {
             next_ep: None,
             menu: false,
             focus: None,
+            sonarr: None,
             req,
         }));
         self.scroll_reset = true;
@@ -138,7 +151,7 @@ impl App {
         });
     }
 
-    pub(super) fn on_title_loaded(&mut self, req: u64, result: Result<TitleData, String>) {
+    pub(super) fn on_title_loaded(&mut self, req: u64, result: Result<TitleData, String>, ctx: &egui::Context) {
         for d in self.detail.iter_mut() {
             if let Detail::Title(v) = d {
                 if v.req != req {
@@ -158,8 +171,31 @@ impl App {
                         if let Some(id) = &t.season_id {
                             v.sel = Sel::Season(id.clone());
                         }
+                        if t.item.kind != "Series" {
+                            log::debug!("sonarr: skipped, '{}' is a {}", t.item.name, t.item.kind);
+                        }
+                        if t.item.kind == "Series" && !self.cfg.sonarr_url.trim().is_empty() && !self.cfg.sonarr_key.trim().is_empty() {
+                            let (url, key) = (self.cfg.sonarr_url.clone(), self.cfg.sonarr_key.clone());
+                            log::debug!("sonarr: querying for '{}' (tvdb {:?})", t.item.name, t.item.provider_ids.get("Tvdb"));
+                            let (tvdb, name) = (t.item.provider_ids.get("Tvdb").cloned(), t.item.name.clone());
+                            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                            std::thread::spawn(move || {
+                                let info = match crate::sonarr::lookup(&url, &key, tvdb.as_deref(), &name) {
+                                    Ok(i) => i,
+                                    Err(e) => {
+                                        log::warn!("sonarr lookup for {name} failed: {e}");
+                                        None
+                                    }
+                                };
+                                let _ = tx.send(Msg::Sonarr { req, info });
+                                ctx.request_repaint();
+                            });
+                        }
                     }
-                    Err(e) => v.error = Some(e.clone()),
+                    Err(e) => {
+                        log::warn!("title page failed: {e}");
+                        v.error = Some(e.clone());
+                    }
                 }
             }
         }
@@ -182,7 +218,11 @@ impl App {
             if let Detail::Title(v) = d {
                 if v.req == req {
                     let people = std::mem::take(&mut v.item.people);
+                    let runtime = v.item.run_time_ticks;
                     v.item = item.clone();
+                    if v.item.run_time_ticks.unwrap_or(0) <= 0 {
+                        v.item.run_time_ticks = runtime;
+                    }
                     if v.item.people.is_empty() {
                         v.item.people = people;
                     }
@@ -203,7 +243,7 @@ impl App {
         ud.is_favorite = !ud.is_favorite;
         let (id, fav, ctx) = (v.item.id.clone(), ud.is_favorite, ctx.clone());
         std::thread::spawn(move || {
-            let _ = client.set_favorite(&id, fav);
+            crate::logged!(client.set_favorite(&id, fav));
             ctx.request_repaint();
         });
     }
@@ -217,8 +257,22 @@ impl App {
     /// Mark a movie / show / episode of the open page watched or unwatched, then refresh the page.
     fn toggle_item_watched(&mut self, target: Item, ctx: &egui::Context) {
         let Some(client) = self.client.clone() else { return };
+        let tile_new = !target.played();
+        // versions: a tile marks only its own version (the title itself is marked watched too);
+        // the title's own check marks or clears all of them
+        let played = if let Some(src) = target.source.clone() {
+            let others_watched = self.cfg.mark_version(&target.id, &src, tile_new);
+            self.cfg.save();
+            tile_new || others_watched
+        } else {
+            if target.media_sources.len() > 1 {
+                let ids: Vec<String> = target.media_sources.iter().map(|m| m.id.clone()).collect();
+                self.cfg.set_all_versions(&target.id, &ids, tile_new);
+                self.cfg.save();
+            }
+            tile_new
+        };
         let Some(Detail::Title(v)) = self.detail.last_mut() else { return };
-        let played = !target.played();
         // optimistic local update
         for it in std::iter::once(&mut v.item).chain(v.episodes.iter_mut()) {
             if it.id == target.id {
@@ -236,7 +290,7 @@ impl App {
         };
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let _ = if played { client.mark_played(&target.id) } else { client.mark_unplayed(&target.id) };
+            crate::logged!(if played { client.mark_played(&target.id) } else { client.mark_unplayed(&target.id) });
             if let Ok((item, next, episodes)) = client.refresh_title(&page_id, series.as_deref(), season.as_deref()) {
                 let _ = tx.send(Msg::TitleRefresh { req, item, next, episodes });
             }
@@ -273,6 +327,7 @@ impl App {
         let (loading, ep_loading, error, hero_ep) = (v.loading, v.ep_loading, v.error.clone(), v.hero_ep.clone());
         let (similar, menu) = (v.similar.clone(), v.menu);
         let focus = v.focus.clone();
+        let vmem = self.cfg.version_mem(&item.id);
         let mut focus_used = false;
         let mut toggle_menu = false;
         let mut close_menu = false;
@@ -298,6 +353,10 @@ impl App {
             Some(Detail::Title(v)) => v.next_ep.clone(),
             _ => None,
         };
+        let sonarr = match self.detail.last() {
+            Some(Detail::Title(v)) => v.sonarr.clone(),
+            _ => None,
+        };
         let spoil = ui::Spoiler { on: self.cfg.spoiler_control, next_id: next_ep.as_ref().map(|e| e.id.clone()) };
         const HIDDEN: &str = "(This episode's synopsis is currently hidden to prevent spoilers.)";
 
@@ -306,17 +365,13 @@ impl App {
             area = area.vertical_scroll_offset(0.0);
         }
         area.show(ui, |ui| {
-            if ui.button("<  Back").clicked() {
-                back = true;
-            }
-            ui.add_space(8.0 * s);
-
             let mut hero_item = item.clone();
-            let mut opts = ui::HeroOpts { watch_button: true, played: item.played(), favorite: Some(item.user_data.as_ref().map_or(false, |u| u.is_favorite)), link_title: item.kind == "Episode", ..Default::default() };
+            let mut opts = ui::HeroOpts { back: true, watch_button: true, played: item.played(), favorite: Some(item.user_data.as_ref().map_or(false, |u| u.is_favorite)), link_title: item.kind == "Episode", ..Default::default() };
             if is_series {
                 opts.play_label = next_ep.as_ref().and_then(|e| e.ep_code()).map(|c| format!("Play {c}"));
                 // an episode in progress turns the button into "Resume S1:E10 from 10:01"
                 opts.resume = next_ep.as_ref().map(|e| e.resume_seconds());
+                opts.right_note = sonarr.as_ref().and_then(|i| i.next.as_ref()).and_then(|n| n.text());
             }
             if let Some(ep) = &hero_ep {
                 let hide = spoil.on && !ep.played();
@@ -339,6 +394,7 @@ impl App {
                 }
             }
             let act = ui::hero(ui, &client, &hero_item, s, &opts);
+            back |= act.back;
             hero_play = act.play;
             hero_toggle = act.toggle_watched;
             hero_fav = act.toggle_favorite;
@@ -346,6 +402,11 @@ impl App {
                 open = Some(item.series_stub());
             }
             ui.add_space(14.0 * s);
+
+            // versions of a film (episodes show theirs above their season's episodes)
+            if item.kind == "Movie" && item.media_sources.len() > 1 {
+                versions_row(ui, &client, &item, &vmem, s, &mut play, &mut hover, &mut open, &mut watched_ep, &spoil);
+            }
 
             if let Some(e) = &error {
                 ui.colored_label(Color32::LIGHT_RED, format!("Could not load this page: {e}"));
@@ -475,6 +536,9 @@ impl App {
                 if loading {
                     ui.spinner();
                 }
+                if item.kind == "Episode" && item.media_sources.len() > 1 {
+                    versions_row(ui, &client, &item, &vmem, s, &mut play, &mut hover, &mut open, &mut watched_ep, &spoil);
+                }
                 if !episodes.is_empty() {
                     ui.label(RichText::new("Episodes").size(18.0 * s).strong());
                     ui.add_space(8.0 * s);
@@ -493,7 +557,7 @@ impl App {
             }
 
             // ---- staff & production (text only)
-            let lines = staff_lines(&item);
+            let lines = staff_lines(&item, sonarr.as_ref().map_or(&[][..], |i| &i.aka[..]));
             if !lines.is_empty() {
                 ui.label(RichText::new("Staff & Production").size(18.0 * s).strong());
                 ui.add_space(8.0 * s);
@@ -577,7 +641,7 @@ impl App {
         let (mut back, mut open) = (false, None::<Item>);
         egui::ScrollArea::vertical().id_salt("person_scroll").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("<  Back").clicked() {
+                if ui::icon_button(ui, ui::Icon::Back, 40.0 * s, true).clicked() {
                     back = true;
                 }
                 ui.label(RichText::new(&name).size(26.0 * s).strong());
@@ -715,7 +779,7 @@ impl App {
 }
 
 /// "Director: A, B" style rows from the credits plus studios and production locations
-fn staff_lines(item: &Item) -> Vec<(String, String)> {
+fn staff_lines(item: &Item, aka: &[String]) -> Vec<(String, String)> {
     const ORDER: [&str; 8] = ["Director", "Writer", "Producer", "Creator", "Composer", "Editor", "Conductor", "Lyricist"];
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for p in item.people.iter().filter(|p| !matches!(p.kind.as_str(), "Actor" | "GuestStar" | "")) {
@@ -739,6 +803,26 @@ fn staff_lines(item: &Item) -> Vec<(String, String)> {
     }
     if !item.production_locations.is_empty() {
         out.push(("Production location".to_string(), item.production_locations.join(", ")));
+    }
+    if !item.genres.is_empty() {
+        out.push((if item.genres.len() > 1 { "Genres" } else { "Genre" }.to_string(), item.genres.join(", ")));
+    }
+    // whole-show estimate: average episode length x episode count
+    if let (true, Some(m), Some(n)) = (item.kind == "Series", item.runtime_minutes(), crate::jellyfin::ep_count(&item.id)) {
+        let tot = m * n as i64;
+        let (d, h, mm) = (tot / 1440, tot % 1440 / 60, tot % 60);
+        let t = if d > 0 { format!("{d}d {h}h") } else if h > 0 { format!("{h}h {mm:02}m") } else { format!("{mm}m") };
+        out.push(("Est. total runtime".to_string(), format!("~{t}")));
+    }
+    // other titles: the original title plus Sonarr's alternates
+    let mut titles: Vec<String> = item.native_title().map(|t| t.to_string()).into_iter().collect();
+    for a in aka {
+        if !titles.iter().any(|t| t.eq_ignore_ascii_case(a)) {
+            titles.push(a.clone());
+        }
+    }
+    if !titles.is_empty() {
+        out.push(("Also known as".to_string(), titles.join("  •  ")));
     }
     out
 }

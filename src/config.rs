@@ -1,4 +1,5 @@
 use directories::ProjectDirs;
+use crate::debuglog::LogOk;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -104,6 +105,22 @@ pub struct Config {
     pub last_profile: String,
     /// Toggle for showing profile switcher on launch
     pub switcher_on_launch: bool,
+    /// Write a debug log file (Settings → Diagnostics)
+    pub debug_log: bool,
+    /// Sonarr address and API key (optional)
+    pub sonarr_url: String,
+    pub sonarr_key: String,
+    /// Per profile and title: which version was watched last and how far each version got
+    pub versions: HashMap<String, VersionMem>,
+}
+
+/// Jellyfin keeps one resume point per title, so the app remembers the rest itself.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VersionMem {
+    /// Media source id of the version watched last (what Continue Watching resumes)
+    pub last: String,
+    /// Seconds watched per media source id; -1 = watched
+    pub pos: HashMap<String, f64>,
 }
 
 impl Default for Config {
@@ -134,19 +151,71 @@ impl Default for Config {
             profiles: Vec::new(),
             last_profile: String::new(),
             switcher_on_launch: false,
+            debug_log: false,
+            sonarr_url: String::new(),
+            sonarr_key: String::new(),
+            versions: HashMap::new(),
         }
     }
 }
 
 impl Config {
+    fn vkey(&self, item: &str) -> String {
+        format!("{}:{item}", self.user_id)
+    }
+
+    pub fn version_mem(&self, item: &str) -> VersionMem {
+        self.versions.get(&self.vkey(item)).cloned().unwrap_or_default()
+    }
+
+    /// Playback of `source` stopped at `pos` seconds (of `dur`)
+    pub fn remember_stop(&mut self, item: &str, source: &str, pos: f64, dur: f64) {
+        let k = self.vkey(item);
+        let m = self.versions.entry(k).or_default();
+        m.last = source.to_string();
+        if dur > 0.0 && pos > 0.92 * dur {
+            m.pos.insert(source.to_string(), -1.0);
+        } else if pos > 1.0 {
+            m.pos.insert(source.to_string(), pos);
+        } else {
+            m.pos.remove(source);
+        }
+    }
+
+    /// Marks one version watched / unwatched; returns whether any other version is still watched
+    pub fn mark_version(&mut self, item: &str, source: &str, watched: bool) -> bool {
+        let k = self.vkey(item);
+        let m = self.versions.entry(k).or_default();
+        m.last = source.to_string();
+        if watched {
+            m.pos.insert(source.to_string(), -1.0);
+        } else {
+            m.pos.remove(source);
+        }
+        m.pos.iter().any(|(s, v)| s != source && *v < 0.0)
+    }
+
+    /// Marks every version of a title watched, or forgets all version progress
+    pub fn set_all_versions(&mut self, item: &str, sources: &[String], watched: bool) {
+        let k = self.vkey(item);
+        if watched {
+            let m = self.versions.entry(k).or_default();
+            for s in sources {
+                m.pos.insert(s.clone(), -1.0);
+            }
+        } else {
+            self.versions.remove(&k);
+        }
+    }
+
     fn path() -> Option<PathBuf> {
         ProjectDirs::from("", "", "callephiin").map(|d| d.config_dir().join("config.json"))
     }
 
     pub fn load() -> Self {
         Self::path()
-            .and_then(|p| fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|p| fs::read_to_string(p).log_ok())
+            .and_then(|s| serde_json::from_str(&s).log_ok())
             .map(|mut c: Config| {
                 c.migrate_profiles();
                 c
@@ -218,10 +287,10 @@ impl Config {
     pub fn save(&self) {
         if let Some(p) = Self::path() {
             if let Some(dir) = p.parent() {
-                let _ = fs::create_dir_all(dir);
+                crate::logged!(fs::create_dir_all(dir));
             }
             if let Ok(s) = serde_json::to_string_pretty(self) {
-                let _ = fs::write(p, s);
+                crate::logged!(fs::write(p, s));
             }
         }
     }

@@ -1,4 +1,5 @@
 use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
+use crate::debuglog::LogOk;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -43,13 +44,13 @@ pub fn spawn(enabled: Arc<AtomicBool>, shared: Shared) {
         loop {
             thread::sleep(Duration::from_secs(1));
 
-            let now_playing = shared.lock().ok().and_then(|g| g.clone());
+            let now_playing = shared.lock().log_ok().and_then(|g| g.clone());
             let active = enabled.load(Ordering::Relaxed);
 
             let Some(np) = now_playing.filter(|_| active) else {
                 if let Some(mut c) = client.take() {
-                    let _ = c.clear_activity();
-                    let _ = c.close();
+                    crate::logged!(c.clear_activity());
+                    crate::logged!(c.close());
                 }
                 last_sent = None;
                 continue;
@@ -100,7 +101,7 @@ pub fn spawn(enabled: Arc<AtomicBool>, shared: Shared) {
             if c.set_activity(act).is_err() {
                 // Connection dropped; reconnect on next tick.
                 if let Some(mut dead) = client.take() {
-                    let _ = dead.close();
+                    crate::logged!(dead.close());
                 }
             } else {
                 last_sent = Some((Instant::now(), np.title.clone(), np.detail.clone(), np.paused));

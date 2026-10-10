@@ -1,4 +1,5 @@
 use crate::config::{Config, StreamMode};
+use crate::debuglog::LogOk;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -47,6 +48,9 @@ pub struct Item {
     #[serde(default)]
     pub people: Vec<Person>,
     pub original_title: Option<String>,
+    /// External ids ("Tvdb", "Imdb", ...)
+    #[serde(default)]
+    pub provider_ids: HashMap<String, String>,
     /// ISO timestamp, e.g. "2026-10-05T00:00:00.0000000Z"
     pub premiere_date: Option<String>,
     /// For seasons: number of episodes
@@ -58,12 +62,67 @@ pub struct Item {
     pub studios: Vec<Named>,
     #[serde(default)]
     pub production_locations: Vec<String>,
+    /// Versions of this item on the server (only present on single-item responses); the first is
+    /// what Jellyfin plays by default
+    #[serde(default)]
+    pub media_sources: Vec<MediaSource>,
+    /// Client-side: version chosen on the page, passed to playback
+    #[serde(skip)]
+    pub source: Option<String>,
+    /// Client-side: name of the version a tile stands for (`name` stays the title's own)
+    #[serde(skip)]
+    pub version_name: Option<String>,
     /// Client-side tag for extras: (owning show/movie id, owner has a logo)
     #[serde(skip)]
     pub owner: Option<(String, bool)>,
     /// Client-side tag on a person's page: the first role they play in this title
     #[serde(skip)]
     pub role: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSource {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub run_time_ticks: Option<i64>,
+}
+
+impl Item {
+    /// One tile per version of this film / episode: the item itself under the version's name. The id
+    /// stays the item's, so marking a version watched marks the film / episode. Progress and the
+    /// watched check come from what the app remembered for each version (`mem`); versions it knows
+    /// nothing about share the server's state only when they are the one watched last.
+    pub fn version_items(&self, mem: &crate::config::VersionMem) -> Vec<Item> {
+        let base = if mem.last.is_empty() { self.media_sources.first().map(|m| m.id.clone()).unwrap_or_default() } else { mem.last.clone() };
+        self.media_sources
+            .iter()
+            .map(|m| {
+                let mut it = self.clone();
+                it.version_name = Some(m.name.clone());
+                it.source = Some(m.id.clone());
+                it.index_number = None;
+                it.parent_index_number = None;
+                it.premiere_date = None;
+                it.community_rating = None;
+                if m.run_time_ticks.unwrap_or(0) > 0 {
+                    it.run_time_ticks = m.run_time_ticks;
+                }
+                let (played, ticks) = match mem.pos.get(&m.id) {
+                    Some(p) if *p < 0.0 => (true, 0),
+                    Some(p) => (false, (*p * 10_000_000.0) as i64),
+                    None if m.id == base => (self.played(), self.user_data.as_ref().map_or(0, |u| u.playback_position_ticks)),
+                    None => (false, 0),
+                };
+                let ud = it.user_data.get_or_insert_with(Default::default);
+                ud.played = played;
+                ud.playback_position_ticks = ticks;
+                it
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -248,6 +307,8 @@ pub struct PlayInfo {
     pub url: String,
     pub play_session_id: String,
     pub media_source_id: String,
+    /// How many versions the server has of this item
+    pub versions: usize,
     pub transcoding: bool,
     pub start_seconds: f64,
     /// (url, title, language) of external subtitle tracks to load into mpv.
@@ -327,12 +388,17 @@ impl Client {
     }
 
     fn get(&self, path: &str) -> Result<reqwest::blocking::Response> {
-        Ok(self
+        log::debug!("GET {path}");
+        let r = self
             .http
             .get(format!("{}{}", self.base, path))
             .header("Authorization", self.auth_header())
-            .send()?
-            .error_for_status()?)
+            .send()
+            .and_then(|r| r.error_for_status());
+        if let Err(e) = &r {
+            log::warn!("GET {path} failed: {e}");
+        }
+        Ok(r?)
     }
 
     fn post(&self, path: &str, body: &Value) -> Result<reqwest::blocking::Response> {
@@ -425,11 +491,16 @@ impl Client {
             self.user_id,
             (item.resume_seconds() * 10_000_000.0) as i64
         );
+        // a version picked on the page; otherwise the server's own default (its first source)
+        let path = match &item.source {
+            Some(id) => format!("{path}&MediaSourceId={id}"),
+            None => path,
+        };
         let v: Value = self.post(&path, &body)?.json()?;
         let session = v["PlaySessionId"].as_str().unwrap_or_default().to_string();
         let src = v["MediaSources"]
             .as_array()
-            .and_then(|a| a.first())
+            .and_then(|a| item.source.as_ref().and_then(|id| a.iter().find(|s| s["Id"].as_str() == Some(id.as_str()))).or_else(|| a.first()))
             .ok_or_else(|| anyhow!("server returned no media sources"))?;
         let source_id = src["Id"].as_str().unwrap_or(&item.id).to_string();
 
@@ -477,6 +548,12 @@ impl Client {
             url,
             play_session_id: session,
             media_source_id: source_id,
+            // asking for one source makes the server list only that one, so go by what we know:
+            // an explicit source only ever comes from a version tile or the remembered version
+            versions: {
+                let n = v["MediaSources"].as_array().map_or(1, |a| a.len());
+                if item.source.is_some() { n.max(2) } else { n.max(item.media_sources.len()) }
+            },
             transcoding,
             start_seconds: item.resume_seconds(),
             external_subs,
@@ -492,7 +569,7 @@ impl Client {
             "IsPaused": paused,
             "PlayMethod": if info.transcoding { "Transcode" } else { "DirectPlay" },
         });
-        let _ = self.post(endpoint, &body);
+        crate::logged!(self.post(endpoint, &body));
     }
 
     pub fn report_start(&self, info: &PlayInfo) {
@@ -530,7 +607,7 @@ impl Client {
     /// Chapter (name, start seconds) list of an item
     pub fn chapters(&self, item_id: &str) -> Vec<(String, f64)> {
         let path = format!("/Users/{}/Items/{item_id}?Fields=Chapters", self.user_id);
-        let Some(v) = self.get(&path).ok().and_then(|r| r.json::<Value>().ok()) else { return vec![] };
+        let Some(v) = self.get(&path).log_ok().and_then(|r| r.json::<Value>().log_ok()) else { return vec![] };
         v["Chapters"]
             .as_array()
             .cloned()
@@ -657,8 +734,8 @@ impl Client {
 
     pub fn is_admin(&self) -> bool {
         self.get(&format!("/Users/{}", self.user_id))
-            .ok()
-            .and_then(|r| r.json::<Value>().ok())
+            .log_ok()
+            .and_then(|r| r.json::<Value>().log_ok())
             .and_then(|v| v["Policy"]["IsAdministrator"].as_bool())
             .unwrap_or(false)
     }
@@ -670,7 +747,7 @@ impl Client {
         let has = |out: &Vec<Segment>, k: SegmentKind| out.iter().any(|s| s.kind == k);
 
         let path = format!("/MediaSegments/{}?includeSegmentTypes=Intro&includeSegmentTypes=Outro", item.id);
-        if let Some(v) = self.get(&path).ok().and_then(|r| r.json::<Value>().ok()) {
+        if let Some(v) = self.get(&path).log_ok().and_then(|r| r.json::<Value>().log_ok()) {
             for s in v["Items"].as_array().cloned().unwrap_or_default() {
                 let kind = match s["Type"].as_str() {
                     Some("Intro") => SegmentKind::Intro,
@@ -687,7 +764,7 @@ impl Client {
 
         if item.is_episode() && (!has(&out, SegmentKind::Intro) || !has(&out, SegmentKind::Outro)) {
             // Intro Skipper: { "Introduction": {Start,End,Valid}, "Credits": {...} }
-            if let Some(v) = self.get(&format!("/Episode/{}/Timestamps", item.id)).ok().and_then(|r| r.json::<Value>().ok()) {
+            if let Some(v) = self.get(&format!("/Episode/{}/Timestamps", item.id)).log_ok().and_then(|r| r.json::<Value>().log_ok()) {
                 for (key, kind) in [("Introduction", SegmentKind::Intro), ("Credits", SegmentKind::Outro)] {
                     let o = &v[key];
                     if !o.is_object() || has(&out, kind) || !o["Valid"].as_bool().unwrap_or(true) {
@@ -703,7 +780,7 @@ impl Client {
         }
         if item.is_episode() && !has(&out, SegmentKind::Intro) {
             // Older Intro Skipper: { "IntroStart", "IntroEnd", "Valid" }
-            if let Some(v) = self.get(&format!("/Episode/{}/IntroTimestamps/v1", item.id)).ok().and_then(|r| r.json::<Value>().ok()) {
+            if let Some(v) = self.get(&format!("/Episode/{}/IntroTimestamps/v1", item.id)).log_ok().and_then(|r| r.json::<Value>().log_ok()) {
                 let start = v["IntroStart"].as_f64().unwrap_or(0.0);
                 let end = v["IntroEnd"].as_f64().unwrap_or(0.0);
                 if v["Valid"].as_bool().unwrap_or(true) && end > start {
@@ -716,7 +793,7 @@ impl Client {
         // segment provider ran. Used only for kinds the APIs above did not provide.
         if !has(&out, SegmentKind::Intro) || !has(&out, SegmentKind::Outro) {
             let path = format!("/Users/{}/Items/{}?Fields=Chapters", self.user_id, item.id);
-            if let Some(v) = self.get(&path).ok().and_then(|r| r.json::<Value>().ok()) {
+            if let Some(v) = self.get(&path).log_ok().and_then(|r| r.json::<Value>().log_ok()) {
                 let total = v["RunTimeTicks"].as_i64().or(item.run_time_ticks).unwrap_or(0) as f64 / 10_000_000.0;
                 let chapters: Vec<(String, f64)> = v["Chapters"]
                     .as_array()
@@ -749,8 +826,8 @@ impl Client {
     pub fn seasons(&self, series_id: &str) -> Vec<Item> {
         let path = format!("/Shows/{series_id}/Seasons?UserId={}&EnableImages=false&EnableUserData=false&Fields=ChildCount", self.user_id);
         self.get(&path)
-            .ok()
-            .and_then(|r| r.json::<ItemsResponse>().ok())
+            .log_ok()
+            .and_then(|r| r.json::<ItemsResponse>().log_ok())
             .map(|r| r.items)
             .unwrap_or_default()
     }
@@ -763,8 +840,8 @@ impl Client {
             Self::FIELDS
         );
         self.get(&path)
-            .ok()
-            .and_then(|r| r.json::<ItemsResponse>().ok())
+            .log_ok()
+            .and_then(|r| r.json::<ItemsResponse>().log_ok())
             .map(|r| r.items)
             .unwrap_or_default()
     }
@@ -772,8 +849,8 @@ impl Client {
     /// (previous, next) episode around `item` across the whole series
     pub fn adjacent_episodes(&self, item: &Item) -> (Option<Item>, Option<Item>) {
         let Some(series) = item.series_id.as_deref().filter(|_| item.is_episode()) else { return (None, None) };
-        let path = format!("/Shows/{series}/Episodes?UserId={}&EnableImages=false", self.user_id);
-        let items = match self.get(&path).ok().and_then(|r| r.json::<ItemsResponse>().ok()) {
+        let path = format!("/Shows/{series}/Episodes?UserId={}&EnableImageTypes=Logo&ImageTypeLimit=1", self.user_id);
+        let items = match self.get(&path).log_ok().and_then(|r| r.json::<ItemsResponse>().log_ok()) {
             Some(r) => r.items,
             None => return (None, None),
         };
@@ -833,8 +910,8 @@ impl Client {
     /// The user's libraries, in the order the user set up in Jellyfin (video libraries only)
     pub fn views(&self) -> Vec<Item> {
         self.get(&format!("/Users/{}/Views", self.user_id))
-            .ok()
-            .and_then(|r| r.json::<ItemsResponse>().ok())
+            .log_ok()
+            .and_then(|r| r.json::<ItemsResponse>().log_ok())
             .map(|r| {
                 r.items
                     .into_iter()
@@ -857,8 +934,8 @@ impl Client {
             Self::FIELDS
         );
         self.get(&path)
-            .ok()
-            .and_then(|r| r.json::<ItemsResponse>().ok())
+            .log_ok()
+            .and_then(|r| r.json::<ItemsResponse>().log_ok())
             .map(|r| r.items)
             .unwrap_or_default()
     }
@@ -918,8 +995,8 @@ impl Client {
 impl Client {
     fn items(&self, path: &str) -> Vec<Item> {
         self.get(path)
-            .ok()
-            .and_then(|r| r.json::<ItemsResponse>().ok())
+            .log_ok()
+            .and_then(|r| r.json::<ItemsResponse>().log_ok())
             .map(|r| r.items)
             .unwrap_or_default()
     }
@@ -1002,8 +1079,8 @@ impl Client {
     pub fn extras(&self, id: &str, owner: &str, owner_logo: bool) -> Vec<Item> {
         let mut v = self
             .get(&format!("/Users/{}/Items/{id}/SpecialFeatures", self.user_id))
-            .ok()
-            .and_then(|r| r.json::<Vec<Item>>().ok())
+            .log_ok()
+            .and_then(|r| r.json::<Vec<Item>>().log_ok())
             .unwrap_or_default();
         for i in v.iter_mut() {
             i.owner = Some((owner.to_string(), owner_logo));
@@ -1013,12 +1090,12 @@ impl Client {
 
     /// Trickplay (scrub preview) metadata for the item being played, if the server generated it
     pub fn trickplay(&self, item_id: &str, media_source_id: &str) -> Option<Trick> {
-        let v: Value = self.get(&format!("/Users/{}/Items/{item_id}", self.user_id)).ok()?.json().ok()?;
+        let v: Value = self.get(&format!("/Users/{}/Items/{item_id}", self.user_id)).log_ok()?.json().log_ok()?;
         let map = v["Trickplay"].get(media_source_id).or_else(|| v["Trickplay"].as_object()?.values().next())?;
         let (w, info) = map
             .as_object()?
             .iter()
-            .filter_map(|(k, v)| Some((k.parse::<u32>().ok()?, v)))
+            .filter_map(|(k, v)| Some((k.parse::<u32>().log_ok()?, v)))
             .min_by_key(|(w, _)| (*w as i64 - 320).abs())?;
         let g = |k: &str| info[k].as_u64().unwrap_or(0);
         let t = Trick {
@@ -1039,10 +1116,10 @@ impl Client {
     pub fn trickplay_tile(&self, t: &Trick, index: u32) -> Option<eframe::egui::ColorImage> {
         let bytes = self
             .get(&format!("/Videos/{}/Trickplay/{}/{index}.jpg?MediaSourceId={}", t.item_id, t.width, t.media_source_id))
-            .ok()?
+            .log_ok()?
             .bytes()
-            .ok()?;
-        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            .log_ok()?;
+        let img = image::load_from_memory(&bytes).log_ok()?.to_rgba8();
         let size = [img.width() as usize, img.height() as usize];
         Some(eframe::egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
     }
@@ -1053,7 +1130,11 @@ impl Client {
 
     /// Load a movie / show / episode page. Shows start on their first real season.
     pub fn load_title(&self, base: &Item) -> Result<TitleData> {
-        let item = self.item_detail(&base.id)?;
+        let mut item = self.item_detail(&base.id)?;
+        // many shows carry no runtime of their own: average their episodes' instead
+        if item.kind == "Series" && item.run_time_ticks.unwrap_or(0) <= 0 {
+            item.run_time_ticks = self.average_runtime(&item.id);
+        }
         if item.kind == "Episode" {
             let mut item = item;
             let series = item.series_id.clone();
@@ -1069,7 +1150,7 @@ impl Client {
                 (Some(sid), Some(season)) => (Some(season.clone()), self.season_episodes(sid, season)),
                 _ => (None, vec![]),
             };
-            let next_ep = series.as_deref().and_then(|s| self.episode_for_series(s).ok());
+            let next_ep = series.as_deref().and_then(|s| self.episode_for_series(s).log_ok());
             return Ok(TitleData { item, next_ep, similar: vec![], seasons: vec![], season_id, episodes, series_extras: vec![], season_extras: vec![], focus: None });
         }
         let series_extras = self.extras(&item.id, &item.id, item.image_tags.contains_key("Logo"));
@@ -1097,14 +1178,14 @@ impl Client {
             None => (None, vec![], vec![]),
         };
         let focus = last.map(|e| e.id);
-        let next_ep = self.episode_for_series(&item.id).ok();
+        let next_ep = self.episode_for_series(&item.id).log_ok();
         Ok(TitleData { item, next_ep, similar, seasons, season_id, episodes, series_extras, season_extras, focus })
     }
 
     /// The furthest episode (by season, then number) that has been watched or started
     fn last_watched(&self, series_id: &str) -> Option<Item> {
         let path = format!("/Shows/{series_id}/Episodes?UserId={}&Fields=SpecialEpisodeNumbers,RunTimeTicks", self.user_id);
-        let items = self.get(&path).ok()?.json::<ItemsResponse>().ok()?.items;
+        let items = self.get(&path).log_ok()?.json::<ItemsResponse>().log_ok()?.items;
         items
             .into_iter()
             .filter(|e| e.played() || e.resume_seconds() > 1.0)
@@ -1120,8 +1201,8 @@ impl Client {
         self.http
             .get(format!("{}/System/Info/Public", self.base))
             .send()
-            .ok()
-            .and_then(|r| r.json::<Value>().ok())
+            .log_ok()
+            .and_then(|r| r.json::<Value>().log_ok())
             .and_then(|v| v["Version"].as_str().map(str::to_string))
             .unwrap_or_default()
     }
@@ -1129,6 +1210,16 @@ impl Client {
     /// Episode count of a show, specials excluded
     pub fn fetch_episode_count(&self, series_id: &str) -> Option<u32> {
         count_from_seasons(&self.seasons(series_id))
+    }
+}
+
+impl Client {
+    /// Mean runtime (ticks) of a show's episodes that report one
+    fn average_runtime(&self, series_id: &str) -> Option<i64> {
+        let path = format!("/Shows/{series_id}/Episodes?UserId={}&Fields=RunTimeTicks", self.user_id);
+        let eps = self.get(&path).log_ok()?.json::<ItemsResponse>().log_ok()?.items;
+        let ticks: Vec<i64> = eps.iter().filter(|e| e.parent_index_number != Some(0)).filter_map(|e| e.run_time_ticks).filter(|t| *t > 0).collect();
+        if ticks.is_empty() { None } else { Some(ticks.iter().sum::<i64>() / ticks.len() as i64) }
     }
 }
 
@@ -1155,7 +1246,7 @@ fn counts() -> &'static std::sync::Mutex<Counts> {
 
 /// Cached episode count; queues a background fetch the first time a show is asked about
 pub fn ep_count(id: &str) -> Option<u32> {
-    let mut c = counts().lock().ok()?;
+    let mut c = counts().lock().log_ok()?;
     if let Some(n) = c.done.get(id) {
         return Some(*n);
     }
@@ -1182,7 +1273,7 @@ impl Client {
         let item = self.item_detail(id)?;
         let series = series_id.unwrap_or(id);
         let is_show_page = item.kind == "Series" || item.kind == "Episode";
-        let next = if is_show_page { self.episode_for_series(series).ok() } else { None };
+        let next = if is_show_page { self.episode_for_series(series).log_ok() } else { None };
         let eps = match season_id {
             Some(s) if is_show_page => self.season_episodes(series, s),
             _ => vec![],
@@ -1208,12 +1299,22 @@ fn watch_key(e: &Item) -> Option<(i32, i32, i32, i32)> {
 
 // ------------------------------------------------------------------------------ forgiving search
 
+/// Lower-case with accents removed ("Pokémon" -> "pokemon"), so searches work on a plain keyboard
+fn fold(s: &str) -> String {
+    const FROM: &str = "àáâãäåāăąçćĉċčďđèéêëēĕėęěĝğġģĥħìíîïĩīĭįĵķĺļľŀłñńņňòóôõöøōŏőŕŗřśŝşšţťŧùúûüũūŭůűųŵýÿŷźżž";
+    const TO: &str = "aaaaaaaaacccccddeeeeeeeeegggghhiiiiiiiijklllllnnnnooooooooorrrsssstttuuuuuuuuuuwyyyzzz";
+    s.to_lowercase()
+        .chars()
+        .map(|c| FROM.chars().position(|f| f == c).and_then(|i| TO.chars().nth(i)).unwrap_or(c))
+        .collect()
+}
+
 fn tokens(s: &str) -> Vec<String> {
-    s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(str::to_string).collect()
+    fold(s).split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(str::to_string).collect()
 }
 
 fn squash(s: &str) -> String {
-    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+    fold(s).chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
 /// Every query word must occur somewhere in the name, ignoring punctuation and spacing

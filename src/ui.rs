@@ -1,11 +1,15 @@
 //! Reusable widgets and painting helpers for the callephiin UI.
 //! Everything that takes `s` scales with the content scale factor.
 
+use crate::debuglog::LogOk;
 use crate::jellyfin::{Client, Item};
 use crate::player::Track;
 use std::collections::HashMap;
 use eframe::egui::{self, pos2, vec2, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, Rounding, Sense, Shape, Stroke, UiBuilder};
 
+/// Page padding the app puts around its content (the hero bleeds through it).
+pub const PAGE_MX: f32 = 28.0;
+pub const PAGE_MY: f32 = 22.0;
 pub const BG: Color32 = Color32::from_rgb(0x0e, 0x10, 0x16);
 pub const PANEL: Color32 = Color32::from_rgb(0x15, 0x18, 0x20);
 pub const ACCENT: Color32 = Color32::from_rgb(0x8a, 0x6b, 0xff);
@@ -63,7 +67,7 @@ pub fn logo(ui: &mut egui::Ui, size: f32) {
 fn render_logo(px: u32) -> Option<egui::ColorImage> {
     let bytes = include_bytes!("../assets/logo.svg");
     use resvg::usvg::TreeParsing;
-    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
+    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).log_ok()?;
     let sz = tree.size;
     let scale = (px as f32 / sz.width()).min(px as f32 / sz.height());
     let mut pm = resvg::tiny_skia::Pixmap::new(px, px)?;
@@ -366,6 +370,10 @@ pub fn seek_bar(ui: &mut egui::Ui, width: f32, value: f64, total: f64, marks: &[
         }
     }
     for &c in chapters {
+        // a chapter that starts at the very end (or the very start) of the video gets no line
+        if c <= 0.5 || c >= total - 1.0 {
+            continue;
+        }
         let x = x_of(c);
         p.line_segment([pos2(x, tr.min.y - 1.5), pos2(x, tr.max.y + 1.5)], Stroke::new(1.5_f32, Color32::from_white_alpha(70)));
     }
@@ -751,11 +759,19 @@ pub fn hero(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, opts: &Hero
     let hero_h = (full_w * 0.22).clamp(420.0 * s, 520.0 * s);
     let (rect, _) = ui.allocate_exact_size(vec2(full_w, hero_h), Sense::hover());
 
+    // The artwork bleeds out to the page edges (past the panel margins) and fades into the page.
+    let (mx, my) = (PAGE_MX * s, PAGE_MY * s);
+    let full = Rect::from_min_max(pos2(rect.left() - mx, rect.top() - my), pos2(rect.right() + mx, rect.bottom()));
+    let vp = ui.clip_rect();
+    let old_clip = vp;
+    let top_clip = vp.top() - my;
+    ui.set_clip_rect(Rect::from_min_max(pos2(full.left(), top_clip), pos2(full.right(), rect.bottom() + 4.0)));
+
     // --- backdrop, cropped to cover the whole hero area ---------------------------------------
     let ep_thumb = item.is_episode() && item.image_tags.contains_key("Primary");
     let has_backdrop = ep_thumb || !item.backdrop_image_tags.is_empty() || !item.parent_backdrop_image_tags.is_empty();
     if has_backdrop {
-        let (rect_aspect, img_aspect) = (rect.width() / rect.height(), 16.0_f32 / 9.0);
+        let (rect_aspect, img_aspect) = (full.width() / full.height(), 16.0_f32 / 9.0);
         let uv = if rect_aspect > img_aspect {
             let vh = img_aspect / rect_aspect;
             let y0 = (1.0 - vh) * 0.3;
@@ -770,39 +786,58 @@ pub fn hero(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, opts: &Hero
         } else {
             client.image_url_w(item.art_id(), "Backdrop", (1920.0 * s.max(1.0)) as u32)
         };
-        let img_rect = Rect::from_min_max(pos2(rect.left(), rect.top() + 2.0), pos2(rect.right(), rect.bottom() - 2.0));
+        {
+            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            if let Ok(mut l) = LAST.lock() {
+                if *l != hero_url {
+                    log::debug!("hero image requested for {} ({})", item.name, item.id);
+                    *l = hero_url.clone();
+                }
+            }
+        }
+        let img_rect = Rect::from_min_max(full.min, pos2(full.right(), rect.bottom() - 2.0));
         if ep_thumb && opts.blur_thumb {
             paint_blurred(ui, hero_url, img_rect, 0.0, uv, 40.0 * s);
         } else {
             egui::Image::new(hero_url).show_loading_spinner(false).uv(uv).paint_at(ui, img_rect);
         }
     } else {
-        ui.painter().rect_filled(rect, 0.0, PANEL);
+        static LAST_NONE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        if let Ok(mut l) = LAST_NONE.lock() {
+            if *l != item.id {
+                log::debug!("hero has no backdrop: {} ({})", item.name, item.id);
+                *l = item.id.clone();
+            }
+        }
+        ui.painter().rect_filled(full, 0.0, PANEL);
     }
     // fade the left edge (for text) and the bottom edge (into the page background)
     hgradient(
         ui.painter(),
-        Rect::from_min_max(rect.left_top(), pos2(rect.left() + rect.width() * 0.62, rect.bottom())),
+        Rect::from_min_max(full.left_top(), pos2(rect.left() + rect.width() * 0.62, rect.bottom())),
         Color32::from_rgba_unmultiplied(0x0e, 0x10, 0x16, 235),
         Color32::TRANSPARENT,
     );
     vgradient(
         ui.painter(),
-        Rect::from_min_max(pos2(rect.left(), rect.top() + hero_h * 0.45), pos2(rect.right(), rect.bottom() + 2.0)),
+        Rect::from_min_max(pos2(full.left(), rect.top() + hero_h * 0.38), pos2(full.right(), rect.bottom() + 2.0)),
         Color32::TRANSPARENT,
         BG,
     );
+    // gentle darkening along the top edge so the artwork melts into the window edge
+    vgradient(ui.painter(), Rect::from_min_size(full.left_top(), vec2(full.width(), 90.0 * s)), Color32::from_black_alpha(90), Color32::TRANSPARENT);
     // solid strip under the gradient: hides any sub-pixel seam where the image meets the page
     ui.painter().rect_filled(
         Rect::from_min_max(pos2(rect.left(), rect.bottom() - 3.0), pos2(rect.right(), rect.bottom() + 2.0)),
         0.0,
         BG,
     );
+    ui.set_clip_rect(old_clip);
 
     // --- fixed text block --------------------------------------------------------------------
     let x = rect.left() + 32.0 * s;
     let box_w = (560.0 * s).min(rect.width() * 0.6);
-    let mut y = rect.top() + 36.0 * s;
+    let mut y = rect.top() + 36.0 * s + if opts.back { 30.0 * s } else { 0.0 };
 
     // logo box: the logo is squeezed/enlarged to fit; without a logo the title is shown instead
     let logo_box = Rect::from_min_size(pos2(x, y), vec2(box_w * 0.75, 110.0 * s));
@@ -824,6 +859,13 @@ pub fn hero(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, opts: &Hero
         let clipped = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
         clipped.galley(pos + vec2(2.0, 2.0) * s, sg, SHADOW);
         clipped.galley(pos, galley, Color32::WHITE);
+    }
+    // back arrow over the artwork (above the logo, never on top of it)
+    let mut back = false;
+    if opts.back {
+        let br = Rect::from_min_size(pos2(rect.left() + 22.0 * s, rect.top() + 12.0 * s), vec2(44.0 * s, 44.0 * s));
+        let mut bui = ui.new_child(UiBuilder::new().max_rect(br));
+        back = icon_button(&mut bui, Icon::Back, 40.0 * s, true).clicked();
     }
     let mut open_title = false;
     if opts.link_title {
@@ -863,12 +905,18 @@ pub fn hero(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, opts: &Hero
         if let Some(sc) = item.community_rating {
             mui.label(RichText::new(format!("★ {sc:.1}")).size(14.5 * s).color(c(Color32::from_rgb(255, 200, 70))));
         }
-        if let Some(n) = ep_count {
-            mui.label(RichText::new(fmt_eps(n)).size(14.5 * s).color(c(Color32::from_gray(215))));
-        }
-        if let Some(m) = item.runtime_minutes() {
+        // episode count and per-episode length share one label so the "・" gets no extra item spacing
+        let rt = item.runtime_minutes().map(|m| {
             let t = if m >= 60 { format!("{}h {:02}m", m / 60, m % 60) } else { format!("{m}m") };
-            mui.label(RichText::new(if item.kind == "Series" { format!("{t} / ep") } else { t }).size(14.5 * s).color(c(Color32::from_gray(215))));
+            if item.kind == "Series" { format!("{t} / ep") } else { t }
+        });
+        let tail = match (ep_count, rt) {
+            (Some(n), Some(r)) => Some(format!("{}・{r}", fmt_eps(n))),
+            (Some(n), None) => Some(fmt_eps(n)),
+            (None, r) => r,
+        };
+        if let Some(t) = tail {
+            mui.label(RichText::new(t).size(14.5 * s).color(c(Color32::from_gray(215))));
         }
     }
     y += 28.0 * s;
@@ -898,7 +946,7 @@ pub fn hero(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, opts: &Hero
     let label = if resume > 1.0 { format!("▶  {base} from {}", fmt_time(resume)) } else { format!("▶  {base}") };
     let btn_rect = Rect::from_min_size(pos2(x, y), vec2(box_w, 42.0 * s));
     let mut bui = ui.new_child(UiBuilder::new().max_rect(btn_rect).layout(Layout::left_to_right(Align::Center)));
-    let mut act = HeroAction { open_title, ..Default::default() };
+    let mut act = HeroAction { open_title, back, ..Default::default() };
     act.play = pill_button(&mut bui, &label, 16.0 * s, 40.0 * s, 22.0 * s, 0.0, 20.0 * s, ACCENT, Color32::WHITE).clicked();
     if opts.watch_button {
         bui.add_space(8.0 * s);
@@ -919,6 +967,12 @@ pub fn hero(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, opts: &Hero
             (false, false) => "Mark as watched",
         };
         act.toggle_watched = resp.on_hover_text(tip).clicked();
+    }
+    if let Some(note) = &opts.right_note {
+        let font = FontId::proportional(15.0 * s);
+        let at = pos2(rect.right() - 32.0 * s, btn_rect.center().y);
+        ui.painter().text(at + vec2(1.5, 1.5) * s, egui::Align2::RIGHT_CENTER, note, font.clone(), SHADOW);
+        ui.painter().text(at, egui::Align2::RIGHT_CENTER, note, font, Color32::from_gray(235));
     }
     if let Some(fav) = opts.favorite {
         bui.add_space(4.0 * s);
@@ -1014,6 +1068,20 @@ pub fn rounded_bottom_gradient(p: &egui::Painter, rect: Rect, r: f32, height: f3
     p.add(egui::Shape::mesh(m));
 }
 
+/// Cross-shaped close button (hover circle, no frame); `size` is the clickable square.
+pub fn cross_button(ui: &mut egui::Ui, size: f32) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    if resp.hovered() {
+        ui.painter().circle_filled(r.center(), size / 2.0, Color32::from_white_alpha(28));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let st = Stroke::new(2.4_f32, if resp.hovered() { Color32::WHITE } else { MUTED });
+    let k = size * 0.16;
+    ui.painter().line_segment([r.center() + vec2(-k, -k), r.center() + vec2(k, k)], st);
+    ui.painter().line_segment([r.center() + vec2(-k, k), r.center() + vec2(k, -k)], st);
+    resp
+}
+
 pub fn hgradient(p: &egui::Painter, r: Rect, left: Color32, right: Color32) {
     let mut m = egui::Mesh::default();
     m.colored_vertex(r.left_top(), left);
@@ -1100,6 +1168,8 @@ pub enum TileMode {
     Extra,
     /// Search result episode: show name, "S1:E2 · Title".
     Search,
+    /// Versions of one film / episode: version name, runtime.
+    Version,
 }
 
 /// Horizontal 16:9 tiles (episodes, extras, search hits). Click plays.
@@ -1134,7 +1204,9 @@ pub fn tile_row(
                 }
                 ui.painter().rect_filled(thumb, r, PANEL);
                 // spoiler control: unwatched episodes get a heavily down-scaled (= blurred) thumbnail
-                let hide = spoil.on && mode == TileMode::Episode && !item.played();
+                let hide = spoil.on && (mode == TileMode::Episode || (mode == TileMode::Version && item.is_episode())) && !item.played();
+                // versions of one item share its id: tell their widgets apart by source
+                let key = item.source.clone().unwrap_or_default();
                 let url = if mode == TileMode::Extra && !item.image_tags.contains_key("Primary") {
                     None
                 } else {
@@ -1158,10 +1230,10 @@ pub fn tile_row(
                     ui.painter().rect_filled(fill, Rounding { nw: 0.0, ne: 0.0, sw: r, se: if frac >= 0.98 { r } else { 0.0 } }, ACCENT);
                 }
                 // watched toggle (episode lists): filled when watched, otherwise shown on hover
-                if mode == TileMode::Episode {
+                if matches!(mode, TileMode::Episode | TileMode::Version) {
                     let cd = 28.0 * s;
                     let check = Rect::from_center_size(pos2(thumb.right() - 10.0 * s - cd / 2.0, thumb.top() + 10.0 * s + cd / 2.0), vec2(cd, cd));
-                    let cr = ui.interact(check, egui::Id::new((id_salt, "watched", &item.id)), Sense::click());
+                    let cr = ui.interact(check, egui::Id::new((id_salt, "watched", &item.id, &key)), Sense::click());
                     let played = item.played();
                     if resp.hovered() || cr.hovered() || played {
                         let fill = if played || cr.hovered() { ACCENT } else { Color32::from_black_alpha(170) };
@@ -1198,6 +1270,7 @@ pub fn tile_row(
                         }
                     }
                     TileMode::Extra => (item.name.clone(), String::new()),
+                    TileMode::Version => (item.version_name.clone().unwrap_or_else(|| item.name.clone()), String::new()),
                     TileMode::Search => (item.display_title(), if item.is_episode() { item.episode_label() } else { String::new() }),
                 };
                 let mut third = if resuming {
@@ -1219,9 +1292,9 @@ pub fn tile_row(
                     TileMode::Episode => Some(item.clone()),
                     TileMode::Search if item.is_episode() => Some(item.series_stub()),
                     TileMode::Search => Some(item.clone()),
-                    TileMode::Extra => None,
+                    TileMode::Extra | TileMode::Version => None,
                 };
-                let id1 = egui::Id::new((id_salt, &item.id, 1));
+                let id1 = egui::Id::new((id_salt, &item.id, 1, &key));
                 if let Some(t) = target1 {
                     if link_line(ui, rect, pos2(x, y), &title, name_font.clone(), Color32::WHITE, tw, id1) {
                         *open = Some(t);
@@ -1328,7 +1401,7 @@ pub fn link_line(ui: &mut egui::Ui, clip: Rect, pos: Pos2, text: &str, font: Fon
 /// "2024-10-05T00:00:00Z" -> "October 5, 2024"
 pub fn fmt_date(iso: &str) -> Option<String> {
     let mut p = iso.get(..10)?.split('-');
-    let (y, m, d): (u32, usize, u32) = (p.next()?.parse().ok()?, p.next()?.parse().ok()?, p.next()?.parse().ok()?);
+    let (y, m, d): (u32, usize, u32) = (p.next()?.parse().log_ok()?, p.next()?.parse().log_ok()?, p.next()?.parse().log_ok()?);
     const M: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
     Some(format!("{} {d}, {y}", M.get(m.checked_sub(1)?)?))
 }
@@ -1419,6 +1492,64 @@ pub fn hscroll(ui: &mut egui::Ui, id_salt: &str, s: f32, add: impl FnOnce(&mut e
     }
 }
 
+/// Pre-blurred black silhouette of a logo, used as its drop shadow.
+enum ShSlot {
+    Pending,
+    Failed,
+    Image(egui::ColorImage, [usize; 2], f32),
+    Tex(egui::TextureHandle, [usize; 2], f32),
+}
+
+fn shadow_slots() -> &'static std::sync::Mutex<HashMap<String, ShSlot>> {
+    static B: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ShSlot>>> = std::sync::OnceLock::new();
+    B.get_or_init(Default::default)
+}
+
+fn fetch_logo_shadow(url: &str) -> Option<ShSlot> {
+    let bytes = reqwest::blocking::get(url).log_ok()?.error_for_status().log_ok()?.bytes().log_ok()?;
+    let src = image::load_from_memory(&bytes).log_ok()?.to_rgba8();
+    let pad = 14u32;
+    let (w, h) = (src.width(), src.height());
+    let mut canvas = image::RgbaImage::new(w + 2 * pad, h + 2 * pad);
+    for (x, y, p) in src.enumerate_pixels() {
+        canvas.put_pixel(x + pad, y + pad, image::Rgba([0, 0, 0, p[3]]));
+    }
+    let b = image::imageops::blur(&canvas, 5.0);
+    let img = egui::ColorImage::from_rgba_unmultiplied([b.width() as usize, b.height() as usize], b.as_raw());
+    Some(ShSlot::Image(img, [w as usize, h as usize], pad as f32))
+}
+
+/// Soft black drop shadow for a logo drawn at `logo` (its natural pixel size maps onto the rect).
+pub fn paint_logo_shadow(ui: &egui::Ui, url: &str, logo: Rect) {
+    let ctx = ui.ctx().clone();
+    let Ok(mut m) = shadow_slots().lock() else { return };
+    let slot = m.entry(url.to_string()).or_insert_with(|| {
+        let (u2, c2) = (url.to_string(), ctx.clone());
+        std::thread::spawn(move || {
+            let slot = fetch_logo_shadow(&u2).unwrap_or(ShSlot::Failed);
+            if let Ok(mut m) = shadow_slots().lock() {
+                m.insert(u2, slot);
+            }
+            c2.request_repaint();
+        });
+        ShSlot::Pending
+    });
+    if let ShSlot::Image(img, sz, pad) = slot {
+        let tex = ctx.load_texture(format!("logo_shadow_{url}"), img.clone(), egui::TextureOptions::LINEAR);
+        *slot = ShSlot::Tex(tex, *sz, *pad);
+    }
+    if let ShSlot::Tex(tex, sz, pad) = slot {
+        let k = logo.width() / sz[0] as f32;
+        let r = Rect::from_min_size(
+            logo.min - vec2(*pad * k, *pad * k) + vec2(0.0, 2.0 * k),
+            vec2((sz[0] as f32 + 2.0 * *pad) * k, (sz[1] as f32 + 2.0 * *pad) * k),
+        );
+        for _ in 0..2 {
+            egui::Image::new(egui::load::SizedTexture::new(tex.id(), r.size())).tint(Color32::from_white_alpha(215)).paint_at(ui, r);
+        }
+    }
+}
+
 enum Slot {
     Pending,
     Failed,
@@ -1432,8 +1563,8 @@ fn blurs() -> &'static std::sync::Mutex<HashMap<String, Slot>> {
 }
 
 fn fetch_blurred(url: &str) -> Option<egui::ColorImage> {
-    let bytes = reqwest::blocking::get(url).ok()?.error_for_status().ok()?.bytes().ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
+    let bytes = reqwest::blocking::get(url).log_ok()?.error_for_status().log_ok()?.bytes().log_ok()?;
+    let img = image::load_from_memory(&bytes).log_ok()?;
     let small = img.resize(256, 256, image::imageops::FilterType::Triangle).to_rgba8();
     let blurred = image::imageops::blur(&small, 7.0);
     Some(egui::ColorImage::from_rgba_unmultiplied([blurred.width() as usize, blurred.height() as usize], blurred.as_raw()))
@@ -1500,7 +1631,11 @@ pub struct Spoiler {
 
 #[derive(Default)]
 pub struct HeroOpts {
+    /// Right-aligned line on the button row (e.g. when the next episode airs).
+    pub right_note: Option<String>,
     /// Replaces "Play" (e.g. "Play S1:E1").
+    /// Draw a back arrow over the artwork.
+    pub back: bool,
     pub play_label: Option<String>,
     /// Resume point of the item Play will start, when it differs from the shown item (shows).
     pub resume: Option<f64>,
@@ -1521,4 +1656,5 @@ pub struct HeroAction {
     pub toggle_watched: bool,
     pub toggle_favorite: bool,
     pub open_title: bool,
+    pub back: bool,
 }
