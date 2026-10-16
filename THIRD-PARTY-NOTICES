@@ -1,3 +1,146 @@
+# Third-party components shipped with callephiin binaries
+
+These components are distributed alongside the callephiin executable. They are separate
+works under their own licenses. The Rust crates callephiin is built from are listed below.
+
+callephiin itself is licensed under GPL-3.0-or-later (see `LICENSE`).
+
+## Windows release
+
+### libmpv (`libmpv-2.dll`)
+
+- Project: mpv, https://mpv.io
+- Build used: `mpv-dev-x86_64-20261004-git-413ff0b1cd` (mpv-winbuild, based on mpv commit `413ff0b1cd`)
+- License: GNU GPL v2 or later (mpv). The prebuilt Windows build also contains FFmpeg and
+  other libraries compiled with GPL options, so the combined libmpv binary is distributed
+  under the GPL; treat it as GPLv3 unless the build's notes say otherwise.
+- Source code:
+  - mpv: https://github.com/mpv-player/mpv (commit `413ff0b1cd`)
+  - Build scripts and the exact library versions used for this build:
+    https://github.com/shinchiro/mpv-winbuild-cmake
+- callephiin links to libmpv dynamically and is itself GPL-3.0-or-later.
+
+### FFmpeg (inside libmpv-2.dll)
+
+- Project: https://ffmpeg.org
+- License: GPL (built with `--enable-gpl`; likely version 3), see https://ffmpeg.org/legal.html
+- Source: https://git.ffmpeg.org/ffmpeg.git, at the version pinned by the mpv-winbuild
+  build above.
+
+### Other libraries statically contained in libmpv-2.dll
+
+The mpv-winbuild project builds libmpv with a set of third-party libraries. Typical
+contents are listed below; the authoritative list and versions are in the build scripts
+linked above.
+
+| Library | License |
+|---|---|
+| libass | ISC |
+| FreeType | FreeType License or GPL-2.0 |
+| HarfBuzz | MIT |
+| FriBidi | LGPL-2.1-or-later |
+| libplacebo | LGPL-2.1-or-later |
+| dav1d | BSD-2-Clause |
+| lcms2 | MIT |
+| zlib | Zlib |
+| libarchive | BSD-2-Clause |
+| uchardet | MPL-1.1 / GPL-2.0 / LGPL-2.1 |
+| LuaJIT | MIT |
+| shaderc / SPIRV-Cross / glslang | Apache-2.0 / Apache-2.0 / BSD-3-Clause |
+
+### ANGLE (`libEGL.dll`, `libGLESv2.dll`)
+
+- Project: https://chromium.googlesource.com/angle/angle
+- License: BSD-3-Clause
+
+```
+Copyright 2018 The ANGLE Project Authors.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+  Redistributions of source code must retain the above copyright
+  notice, this list of conditions and the following disclaimer.
+
+  Redistributions in binary form must reproduce the above
+  copyright notice, this list of conditions and the following
+  disclaimer in the documentation and/or other materials provided
+  with the distribution.
+
+  Neither the name of TransGaming Inc., Google Inc., 3DLabs Inc.
+  Ltd., nor the names of their contributors may be used to endorse
+  or promote products derived from this software without specific
+  prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+```
+
+### Direct3D shader compiler (`d3dcompiler_47.dll`)
+
+- Component of Microsoft Windows / the Windows SDK. Not open source.
+- Redistributed unmodified as permitted by Microsoft's redistribution terms for this file.
+- It is a separate work and is not covered by callephiin's license.
+
+## macOS release (Apple Silicon)
+
+The macOS app bundle contains `libmpv.2.dylib` and its dependencies, copied from the
+Homebrew `mpv` package by `dylibbundler` at build time into
+`callephiin.app/Contents/Frameworks/`. The combined binary is distributed under the GPL
+(mpv, FFmpeg, x264, x265 and Rubber Band are GPL); treat it as GPLv3 because Homebrew builds
+FFmpeg with `--enable-version3`.
+
+| Library (file in Frameworks/) | License |
+|---|---|
+| mpv (`libmpv`) | GPL-2.0-or-later |
+| FFmpeg (`libavcodec`, `libavdevice`, `libavfilter`, `libavformat`, `libavutil`, `libswresample`, `libswscale`) | GPL-2.0-or-later / GPL-3.0 as built |
+| x264 (`libx264`) | GPL-2.0-or-later |
+| x265 (`libx265`) | GPL-2.0-or-later |
+| Rubber Band (`librubberband`) | GPL-2.0-or-later |
+| libplacebo | LGPL-2.1-or-later |
+| libbluray, libudfread | LGPL-2.1-or-later |
+| FriBidi | LGPL-2.1-or-later |
+| GLib (`libglib-2.0`), gettext (`libintl`) | LGPL-2.1-or-later |
+| Graphite2 | LGPL-2.1-or-later, MPL-1.1 or GPL-2.0-or-later |
+| LAME (`libmp3lame`) | LGPL-2.0-or-later |
+| mpg123 | LGPL-2.1 |
+| uchardet | MPL-1.1, GPL-2.0-or-later or LGPL-2.1-or-later |
+| OpenSSL (`libssl`, `libcrypto`) | Apache-2.0 |
+| libass, mujs | ISC |
+| HarfBuzz, Little CMS (`liblcms2`), LuaJIT, Brotli | MIT |
+| Fontconfig | MIT-style (fontconfig license) |
+| FreeType | FreeType License or GPL-2.0 |
+| libpng | libpng license |
+| libjpeg-turbo (`libjpeg`) | BSD-3-Clause, IJG, Zlib |
+| dav1d, libarchive, libsamplerate, libvmaf, LZ4 | BSD-2-Clause (libvmaf also has a patent grant) |
+| libvpx, Opus, PCRE2, Zstandard | BSD-3-Clause (Zstandard is also GPL-2.0) |
+| SVT-AV1 (`libSvtAv1Enc`) | BSD-3-Clause-Clear plus the AOM patent license |
+| liblzma (xz) | 0BSD / public domain |
+| libb2 (BLAKE2) | CC0-1.0, OpenSSL or Apache-2.0 |
+| shaderc, Vulkan loader (`libvulkan`) | Apache-2.0 |
+| libunibreak | Zlib |
+| zimg (`libzimg`) | WTFPL |
+
+## Source availability
+
+The corresponding source for callephiin is in this repository. The source for the GPL
+components distributed in binary form with callephiin is available from the links above.
+If any link stops working, write to the project and the matching source will be provided.
+
+# Crates
+
 ab_glyph        0.2.32  Alex Butler <alexheretic@gmail.com>     https://github.com/alexheretic/ab-glyph Apache-2.0              API for loading, scaling, positioning and rasterizing OpenType font glyphs.
 ab_glyph_rasterizer     0.1.10  Alex Butler <alexheretic@gmail.com>     https://github.com/alexheretic/ab-glyph Apache-2.0              Coverage rasterization for lines, quadratic & cubic beziers
 adler2  2.0.1   Jonas Schievink <jonasschievink@gmail.com>|oyvindln <oyvindln@users.noreply.github.com> https://github.com/oyvindln/adler20BSD OR Apache-2.0 OR MIT               A simple clean-room implementation of the Adler-32 checksum
