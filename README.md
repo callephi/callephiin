@@ -37,6 +37,7 @@ As of v1.2.0, `libmpv` and `ANGLE` libraries are now included in the release.
 - [resvg](https://github.com/linebender/resvg) for rendering callephiin logo
 - [image](https://github.com/image-rs/image)
 - [mpv](https://github.com/mpv-player/mpv) via `libmpv2`
+- [ffmpeg](https://github.com/FFmpeg/FFmpeg)
 - [ANGLE](https://github.com/electron/electron) from Electron (Windows-only)
 
 **Data & Networking:** 
@@ -77,3 +78,6 @@ Final output will be in the `dist` folder as a `.app` and `.dmg` for easy transp
 
 ⚠️ **If the script won't open**:
 In the repo folder, run ```chmod +x build_callephiin_macos.sh``` to make the script executable.
+
+## License
+[GNU General Public License v3.0 ©](https://github.com/callephi/callephiin/blob/main/LICENSE)
