@@ -97,6 +97,18 @@ pub fn nav_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool, he
         let st = Stroke::new(2.2_f32, color);
         ui.painter().circle_stroke(c, 7.0, st);
         ui.painter().line_segment([c + vec2(5.0, 5.0), c + vec2(11.0, 11.0)], st);
+    } else if icon == "calendar" {
+        let c = pos2(rect.center().x, cy(22.0));
+        let st = Stroke::new(2.0_f32, color);
+        let body = Rect::from_center_size(c + vec2(0.0, 1.5), vec2(20.0, 18.0));
+        ui.painter().rect_stroke(body, 3.0, st);
+        ui.painter().line_segment([pos2(body.left(), body.top() + 5.5), pos2(body.right(), body.top() + 5.5)], st);
+        for dx in [-5.0_f32, 5.0] {
+            ui.painter().line_segment([pos2(c.x + dx, body.top() - 3.0), pos2(c.x + dx, body.top() + 2.0)], st);
+        }
+        for (dx, dy) in [(-5.0_f32, 2.0_f32), (0.0, 2.0), (5.0, 2.0), (-5.0, 7.0), (0.0, 7.0)] {
+            ui.painter().circle_filled(pos2(c.x + dx, body.top() + 5.5 + dy), 1.2, color);
+        }
     } else if icon == "home" {
         let c = pos2(rect.center().x, cy(22.0));
         let st = Stroke::new(2.0_f32, color);
@@ -188,12 +200,14 @@ pub enum Icon {
     Subtitles,
     Audio,
     Volume,
+    Muted,
     Back,
     Prev,
     Next,
     Fullscreen,
     ExitFullscreen,
     Episodes,
+    Refresh,
 }
 
 /// Square icon button drawn with the painter (no font glyphs needed).
@@ -255,7 +269,7 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, enabled: bool) -> e
                 p.line_segment([pos2(x, c.y - hgt * size / 2.0), pos2(x, c.y + hgt * size / 2.0)], Stroke::new(2.4_f32, col));
             }
         }
-        Icon::Volume => {
+        Icon::Volume | Icon::Muted => {
             let x = c.x - 0.2 * size;
             p.add(Shape::convex_polygon(
                 vec![
@@ -269,7 +283,12 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, enabled: bool) -> e
                 col,
                 Stroke::NONE,
             ));
-            for (k, r) in [0.13_f32, 0.24].iter().enumerate() {
+            if icon == Icon::Muted {
+                let (cx, cy, s) = (x + 0.4 * size, c.y, 0.11 * size);
+                p.line_segment([pos2(cx - s, cy - s), pos2(cx + s, cy + s)], Stroke::new(2.0_f32, col));
+                p.line_segment([pos2(cx - s, cy + s), pos2(cx + s, cy - s)], Stroke::new(2.0_f32, col));
+            }
+            for (k, r) in [0.13_f32, 0.24].iter().enumerate().filter(|_| icon == Icon::Volume) {
                 let pts: Vec<_> = (-4..=4)
                     .map(|i| {
                         let a = i as f32 * 0.14;
@@ -278,6 +297,27 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, enabled: bool) -> e
                     .collect();
                 p.add(Shape::line(pts, Stroke::new(1.8_f32, col)));
             }
+        }
+        Icon::Refresh => {
+            // ~300 degree arc with an arrowhead at its end
+            let r = 0.26 * size;
+            let (a0, a1) = (-1.2_f32, 3.9_f32);
+            let pts: Vec<Pos2> = (0..=24)
+                .map(|i| {
+                    let a = a0 + (a1 - a0) * i as f32 / 24.0;
+                    pos2(c.x + r * a.cos(), c.y + r * a.sin())
+                })
+                .collect();
+            p.add(Shape::line(pts, Stroke::new(2.2_f32, col)));
+            let end = pos2(c.x + r * a1.cos(), c.y + r * a1.sin());
+            let tang = vec2(-a1.sin(), a1.cos());
+            let nrm = vec2(a1.cos(), a1.sin());
+            let hl = 0.13 * size;
+            p.add(Shape::convex_polygon(
+                vec![end + tang * hl, end - nrm * hl * 0.9 - tang * hl * 0.1, end + nrm * hl * 0.9 - tang * hl * 0.1],
+                col,
+                Stroke::NONE,
+            ));
         }
         Icon::Back => {
             let w = 0.14 * size;
@@ -603,7 +643,7 @@ pub fn resume_row(
                 if spoiler && item.is_episode() && !item.played() {
                     paint_blurred(ui, thumb_url, thumb, r, FULL_UV, 18.0 * s);
                 } else {
-                    egui::Image::new(thumb_url).show_loading_spinner(false).rounding(r).paint_at(ui, thumb);
+                    paint_thumb(ui, thumb_url, thumb, r);
                 }
 
                 // watched-progress line along the bottom edge of the thumbnail (resumable items only)
@@ -699,7 +739,7 @@ pub fn episode_row(ui: &mut egui::Ui, client: &Client, ep: &Item, current: bool,
     if hide {
         paint_blurred(ui, url, thumb, 8.0, FULL_UV, 0.0);
     } else {
-        egui::Image::new(url).show_loading_spinner(false).rounding(8.0).paint_at(ui, thumb);
+        paint_thumb(ui, url, thumb, 8.0);
     }
     let frac = ep.progress();
     if frac > 0.01 {
@@ -1020,6 +1060,10 @@ pub fn hero(ui: &mut egui::Ui, client: &Client, item: &Item, s: f32, opts: &Hero
         }
         act.toggle_favorite = resp.on_hover_text(if fav { "Remove from favorites" } else { "Add to favorites" }).clicked();
     }
+    if opts.refresh {
+        bui.add_space(4.0 * s);
+        act.refresh = icon_button(&mut bui, Icon::Refresh, 40.0 * s, true).on_hover_text("Refresh").clicked();
+    }
     act
 }
 
@@ -1093,34 +1137,86 @@ pub fn hgradient(p: &egui::Painter, r: Rect, left: Color32, right: Color32) {
     p.add(egui::Shape::mesh(m));
 }
 
-fn lang_name(code: &str) -> String {
+/// Display name for a language code ("eng", "en", "en-US", "pt_BR" ...); unknown codes stay as given.
+pub fn lang_name(code: &str) -> String {
+    const LANGS: &[(&str, &[&str])] = &[
+        ("English", &["eng", "en"]), ("Japanese", &["jpn", "ja"]), ("Spanish", &["spa", "es"]),
+        ("French", &["fre", "fra", "fr"]), ("German", &["ger", "deu", "de"]), ("Italian", &["ita", "it"]),
+        ("Portuguese", &["por", "pt"]), ("Russian", &["rus", "ru"]), ("Korean", &["kor", "ko"]),
+        ("Chinese", &["chi", "zho", "zh", "cmn", "yue"]), ("Arabic", &["ara", "ar"]), ("Hindi", &["hin", "hi"]),
+        ("Dutch", &["dut", "nld", "nl"]), ("Polish", &["pol", "pl"]), ("Swedish", &["swe", "sv"]),
+        ("Turkish", &["tur", "tr"]), ("Thai", &["tha", "th"]), ("Vietnamese", &["vie", "vi"]),
+        ("Bulgarian", &["bul", "bg"]), ("Czech", &["cze", "ces", "cs"]), ("Danish", &["dan", "da"]),
+        ("Finnish", &["fin", "fi"]), ("Greek", &["gre", "ell", "el"]), ("Hebrew", &["heb", "he", "iw"]),
+        ("Hungarian", &["hun", "hu"]), ("Indonesian", &["ind", "id"]), ("Norwegian", &["nor", "no", "nob", "nb", "nno", "nn"]),
+        ("Romanian", &["rum", "ron", "ro"]), ("Ukrainian", &["ukr", "uk"]), ("Catalan", &["cat", "ca"]),
+        ("Croatian", &["hrv", "hr"]), ("Slovenian", &["slv", "sl"]), ("Slovak", &["slo", "slk", "sk"]),
+        ("Serbian", &["srp", "sr"]), ("Bosnian", &["bos", "bs"]), ("Macedonian", &["mac", "mkd", "mk"]),
+        ("Estonian", &["est", "et"]), ("Latvian", &["lav", "lv"]), ("Lithuanian", &["lit", "lt"]),
+        ("Filipino", &["fil", "tgl", "tl"]), ("Malay", &["may", "msa", "ms"]), ("Persian", &["per", "fas", "fa"]),
+        ("Icelandic", &["ice", "isl", "is"]), ("Bengali", &["ben", "bn"]), ("Tamil", &["tam", "ta"]),
+        ("Telugu", &["tel", "te"]), ("Urdu", &["urd", "ur"]), ("Basque", &["baq", "eus", "eu"]),
+        ("Galician", &["glg", "gl"]), ("Albanian", &["alb", "sqi", "sq"]), ("Georgian", &["geo", "kat", "ka"]),
+        ("Armenian", &["arm", "hye", "hy"]), ("Latin", &["lat", "la"]), ("Welsh", &["wel", "cym", "cy"]),
+        ("Irish", &["gle", "ga"]), ("Afrikaans", &["afr", "af"]), ("Kannada", &["kan", "kn"]),
+        ("Malayalam", &["mal", "ml"]), ("Marathi", &["mar", "mr"]), ("Punjabi", &["pan", "pa"]),
+        ("Gujarati", &["guj", "gu"]), ("Sinhala", &["sin", "si"]), ("Nepali", &["nep", "ne"]),
+        ("Mongolian", &["mon", "mn"]), ("Kazakh", &["kaz", "kk"]), ("Azerbaijani", &["aze", "az"]),
+        ("Belarusian", &["bel", "be"]), ("Swahili", &["swa", "sw"]), ("Burmese", &["bur", "mya", "my"]),
+        ("Khmer", &["khm", "km"]), ("Lao", &["lao", "lo"]),
+    ];
+    // "en-US" / "pt_BR" read as their base language
     let c = code.to_ascii_lowercase();
-    let name = match c.as_str() {
-        "eng" | "en" => "English",
-        "jpn" | "ja" => "Japanese",
-        "spa" | "es" => "Spanish",
-        "fre" | "fra" | "fr" => "French",
-        "ger" | "deu" | "de" => "German",
-        "ita" | "it" => "Italian",
-        "por" | "pt" => "Portuguese",
-        "rus" | "ru" => "Russian",
-        "kor" | "ko" => "Korean",
-        "chi" | "zho" | "zh" => "Chinese",
-        "ara" | "ar" => "Arabic",
-        "hin" | "hi" => "Hindi",
-        "dut" | "nld" | "nl" => "Dutch",
-        "pol" | "pl" => "Polish",
-        "swe" | "sv" => "Swedish",
-        "tur" | "tr" => "Turkish",
-        "tha" | "th" => "Thai",
-        "vie" | "vi" => "Vietnamese",
-        "und" | "" => return String::new(),
-        _ => return code.to_uppercase(),
-    };
-    name.to_string()
+    let c = c.split(['-', '_']).next().unwrap_or("");
+    if c.is_empty() || c == "und" || c == "zxx" || c == "mis" {
+        return String::new();
+    }
+    match LANGS.iter().find(|(_, codes)| codes.contains(&c)) {
+        Some((name, _)) => name.to_string(),
+        None => code.to_uppercase(),
+    }
+}
+
+/// Short subtitle format name: "subrip" -> "SRT", "hdmv_pgs_subtitle" -> "PGS"
+fn sub_codec(codec: &str) -> String {
+    match codec.to_ascii_lowercase().as_str() {
+        "subrip" | "srt" => "SRT".into(),
+        "ass" => "ASS".into(),
+        "ssa" => "SSA".into(),
+        "webvtt" | "vtt" => "VTT".into(),
+        "mov_text" => "TX3G".into(),
+        "hdmv_pgs_subtitle" | "pgssub" | "pgs" => "PGS".into(),
+        "dvd_subtitle" | "dvdsub" => "VOBSUB".into(),
+        "dvb_subtitle" | "dvbsub" => "DVB".into(),
+        "" => String::new(),
+        other => other.to_uppercase(),
+    }
 }
 
 /// "English · SDH (SUBRIP) [Forced]"
+/// Subtitle entries read `Name - Language (FORMAT)`, or `Language (FORMAT)` when the track has no name
+pub fn sub_label(t: &Track) -> String {
+    let lang = lang_name(&t.lang);
+    let title = t.title.trim();
+    // mpv names a sidecar after its file when it has no title ("Stream.srt?api_key=...")
+    let junk = title.starts_with("Stream.") || title.contains("api_key=");
+    let named = !(title.is_empty() || junk || title.eq_ignore_ascii_case(&lang));
+    let mut label = match (named, lang.is_empty()) {
+        (false, true) => format!("Track {}", t.id),
+        (false, false) => lang,
+        (true, true) => title.to_string(),
+        (true, false) => format!("{title} - {lang}"),
+    };
+    let codec = sub_codec(&t.codec);
+    if !codec.is_empty() {
+        label.push_str(&format!(" ({codec})"));
+    }
+    if t.forced {
+        label.push_str(" [Forced]");
+    }
+    label
+}
+
 pub fn track_label(t: &Track) -> String {
     let lang = lang_name(&t.lang);
     let mut label = if lang.is_empty() { format!("Track {}", t.id) } else { lang.clone() };
@@ -1216,7 +1312,7 @@ pub fn tile_row(
                     if hide {
                         paint_blurred(ui, url, thumb, r, FULL_UV, 18.0 * s);
                     } else {
-                        egui::Image::new(url).show_loading_spinner(false).rounding(r).paint_at(ui, thumb);
+                        paint_thumb(ui, url, thumb, r);
                     }
                 }
                 let resuming = item.resume_seconds() > 1.0;
@@ -1593,22 +1689,52 @@ pub fn paint_blurred(ui: &egui::Ui, url: String, rect: Rect, rounding: f32, base
                 Slot::Image(img) => {
                     let tex = ctx.load_texture(format!("blur:{url}"), img.clone(), egui::TextureOptions::LINEAR);
                     let id = tex.id();
+                    let aspect = img.size[0] as f32 / (img.size[1] as f32).max(1.0);
                     *slot = Slot::Tex(tex);
-                    Some(id)
+                    Some((id, aspect))
                 }
-                Slot::Tex(t) => Some(t.id()),
+                Slot::Tex(t) => Some((t.id(), t.size_vec2().x / t.size_vec2().y.max(1.0))),
                 _ => None,
             },
         }
     };
     match id {
-        Some(id) => {
+        Some((id, ar)) if base_uv == FULL_UV && ar.is_finite() && ar > 0.0 && (ar / (rect.width() / rect.height()) - 1.0).abs() > 0.02 => {
+            ui.painter().rect_filled(rect, rounding, Color32::BLACK);
+            let fitted = fit_aspect(rect, ar);
+            egui::Image::new(egui::load::SizedTexture::new(id, fitted.size())).paint_at(ui, fitted);
+        }
+        Some((id, _)) => {
             egui::Image::new(egui::load::SizedTexture::new(id, rect.size())).uv(base_uv).rounding(rounding).paint_at(ui, rect);
         }
         None => {
             ui.painter().rect_filled(rect, rounding, PANEL);
         }
     }
+}
+
+/// Draws a thumbnail into a 16:9 box. Images of another aspect ratio keep it and sit on black.
+pub fn paint_thumb(ui: &egui::Ui, url: String, rect: Rect, rounding: f32) {
+    let loaded = egui::Image::new(url.clone()).show_loading_spinner(false).load_for_size(ui.ctx(), rect.size());
+    if let Ok(egui::load::TexturePoll::Ready { texture }) = loaded {
+        let ar = texture.size.x / texture.size.y.max(1.0);
+        if ar.is_finite() && ar > 0.0 && (ar / (rect.width() / rect.height()) - 1.0).abs() > 0.02 {
+            ui.painter().rect_filled(rect, rounding, Color32::BLACK);
+            let fitted = fit_aspect(rect, ar);
+            egui::Image::new(egui::load::SizedTexture::new(texture.id, fitted.size())).paint_at(ui, fitted);
+            return;
+        }
+    }
+    egui::Image::new(url).show_loading_spinner(false).rounding(rounding).paint_at(ui, rect);
+}
+
+fn fit_aspect(rect: Rect, ar: f32) -> Rect {
+    let (mut w, mut h) = (rect.width(), rect.width() / ar);
+    if h > rect.height() {
+        h = rect.height();
+        w = h * ar;
+    }
+    Rect::from_center_size(rect.center(), vec2(w, h))
 }
 
 const FULL_UV: Rect = Rect { min: Pos2 { x: 0.0, y: 0.0 }, max: Pos2 { x: 1.0, y: 1.0 } };
@@ -1648,6 +1774,8 @@ pub struct HeroOpts {
     pub blur_thumb: bool,
     /// Clicking the logo / title opens the show or movie page.
     pub link_title: bool,
+    /// Show a refresh button after the other hero buttons.
+    pub refresh: bool,
 }
 
 #[derive(Default)]
@@ -1655,6 +1783,35 @@ pub struct HeroAction {
     pub play: bool,
     pub toggle_watched: bool,
     pub toggle_favorite: bool,
+    pub refresh: bool,
     pub open_title: bool,
     pub back: bool,
+}
+
+/// Heading above an episode list: "Episodes", or "Season N" when the show has a single season that is not Season 1
+pub fn episodes_heading(seasons: &[crate::jellyfin::Item]) -> String {
+    match seasons {
+        [only] if only.index_number != Some(1) => match only.index_number {
+            Some(n) if n > 0 => format!("Season {n}"),
+            _ if !only.name.is_empty() => only.name.clone(),
+            _ => "Episodes".to_string(),
+        },
+        _ => "Episodes".to_string(),
+    }
+}
+
+/// Keeps the blurred-thumbnail and logo-shadow tables from growing for ever: past a limit they are emptied
+/// and rebuilt on demand.
+pub fn trim_caches() {
+    const LIMIT: usize = 150;
+    if let Ok(mut m) = blurs().lock() {
+        if m.len() > LIMIT {
+            m.clear();
+        }
+    }
+    if let Ok(mut m) = shadow_slots().lock() {
+        if m.len() > LIMIT {
+            m.clear();
+        }
+    }
 }

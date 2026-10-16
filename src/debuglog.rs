@@ -1,6 +1,5 @@
 //! Optional file logging, switched on from Settings ("Enable debug log output"), so debugging
 //! never needs a console window. Off by default.
-use directories::ProjectDirs;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::io::Write;
 use std::path::PathBuf;
@@ -14,7 +13,7 @@ static LOGGER: FileLogger = FileLogger { file: Mutex::new(None) };
 
 fn dir() -> Option<PathBuf> {
     // <app folder>/logs, next to the config folder
-    ProjectDirs::from("", "", "callephiin").and_then(|d| d.config_dir().parent().map(|p| p.join("logs")))
+    crate::backup::root().map(|r| r.join("logs"))
 }
 
 /// callephiin's own log.
@@ -51,7 +50,7 @@ pub fn set_enabled(on: bool) {
         }
         log::set_max_level(LevelFilter::Debug);
         if let Some(file) = f.as_mut() {
-            let _ = writeln!(file, "---- callephiin v{} debug log started ----", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(file, "---- callephiin v{} {} debug log started ----", env!("CARGO_PKG_VERSION"), crate::VERSION_NAME);
         }
     } else {
         log::set_max_level(LevelFilter::Off);

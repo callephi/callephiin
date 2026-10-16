@@ -1,4 +1,3 @@
-use directories::ProjectDirs;
 use crate::debuglog::LogOk;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,6 +48,10 @@ pub struct Profile {
     pub username: String,
     pub user_id: String,
     pub access_token: String,
+    /// Device id this profile signed in with. Jellyfin keeps one session per user and device, so
+    /// profiles for the same user (e.g. reached through two domains) need devices of their own,
+    /// or signing in to one logs the other out. Empty = an older profile that uses the shared id.
+    pub device_id: String,
 }
 
 impl Profile {
@@ -68,6 +71,9 @@ pub struct Config {
     pub user_id: String,
     pub access_token: String,
     pub device_id: String,
+    /// Set while signing in: the device id to sign in with (becomes the profile's)
+    #[serde(skip)]
+    pub login_device_id: Option<String>,
 
     pub stream_mode: StreamMode,
     /// Remote streaming cap in kbit/s (used when transcoding)
@@ -90,7 +96,7 @@ pub struct Config {
     pub ui_scale: f32,
     /// The user picked "Custom" in the scale list (so a custom value equal to a preset stays custom)
     pub ui_scale_custom: bool,
-    /// Load external (sidecar) subtitle files the server lists for a title. Why doesn't this work
+    /// Unused (sidecar loading is no longer a setting); kept so old config files still load
     pub external_tracks: bool,
     /// Seconds jumped by the back/forward buttons or arrow keys
     pub skip_back_secs: u32,
@@ -107,6 +113,17 @@ pub struct Config {
     pub switcher_on_launch: bool,
     /// Write a debug log file (Settings → Diagnostics)
     pub debug_log: bool,
+    /// V-Sync: a first-run config turns it on only when the ANGLE libraries are present (the native NVIDIA OpenGL path flickers with it on).
+    /// `skip_mpv` is a diagnostic: do not create the mpv player at all.
+    pub vsync: bool,
+    pub skip_mpv: bool,
+    /// Wait for the GPU to finish every frame (avoids flashing / tearing on some setups).
+    pub gl_finish: bool,
+    /// Draw through ANGLE (OpenGL ES on Direct3D 11) on Windows when libEGL.dll / libGLESv2.dll sit next
+    /// to the program; falls back to the plain OpenGL driver otherwise. Needs a restart.
+    pub angle: bool,
+    /// Windows: wait for the desktop compositor after each frame (stops tearing bars with vsync off)
+    pub dwm_flush: bool,
     /// Sonarr address and API key (optional)
     pub sonarr_url: String,
     pub sonarr_key: String,
@@ -131,6 +148,7 @@ impl Default for Config {
             user_id: String::new(),
             access_token: String::new(),
             device_id: uuid::Uuid::new_v4().to_string(),
+            login_device_id: None,
             stream_mode: StreamMode::Auto,
             remote_bitrate_kbps: 8_000,
             discord_enabled: true,
@@ -152,6 +170,13 @@ impl Default for Config {
             last_profile: String::new(),
             switcher_on_launch: false,
             debug_log: false,
+            // V-Sync only flickers on the native NVIDIA OpenGL path, so a first-run config turns it on
+            // exactly when the ANGLE libraries are next to the program
+            vsync: cfg!(target_os = "macos") || angle_libs_present(),
+            skip_mpv: false,
+            gl_finish: true,
+            angle: true,
+            dwm_flush: true,
             sonarr_url: String::new(),
             sonarr_key: String::new(),
             versions: HashMap::new(),
@@ -208,8 +233,9 @@ impl Config {
         }
     }
 
-    fn path() -> Option<PathBuf> {
-        ProjectDirs::from("", "", "callephiin").map(|d| d.config_dir().join("config.json"))
+    pub fn path() -> Option<PathBuf> {
+        // <app folder>/config/config.json on every platform, so an export from one OS imports on another
+        crate::backup::root().map(|r| r.join("config").join("config.json"))
     }
 
     pub fn load() -> Self {
@@ -257,10 +283,32 @@ impl Config {
         p.username = self.username.clone();
         p.user_id = self.user_id.clone();
         p.access_token = self.access_token.clone();
+        if let Some(d) = self.login_device_id.take() {
+            p.device_id = d;
+        }
         if !name.trim().is_empty() {
             p.name = name.trim().to_string();
         }
         self.last_profile = p.id.clone();
+    }
+
+    /// Device id to present to the server for the active profile
+    pub fn active_device_id(&self) -> String {
+        if let Some(d) = &self.login_device_id {
+            return d.clone();
+        }
+        self.profile(&self.last_profile).map(|p| p.device_id.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| self.device_id.clone())
+    }
+
+    /// Device id for signing in as `server` + `user`: the saved profile's own, else a fresh one
+    pub fn device_id_for_login(&self, server: &str, user: &str) -> String {
+        let norm = |u: &str| u.trim().trim_end_matches('/').to_lowercase();
+        self.profiles
+            .iter()
+            .find(|p| norm(&p.server_url) == norm(server) && p.username.eq_ignore_ascii_case(user))
+            .map(|p| p.device_id.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
     }
 
     /// Make a saved profile the signed-in account
@@ -302,4 +350,12 @@ impl Config {
 
 fn default_page_size() -> usize {
     25
+}
+
+/// True when all three ANGLE libraries sit in the program's folder.
+pub fn angle_libs_present() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| ["libEGL.dll", "libGLESv2.dll", "d3dcompiler_47.dll"].iter().all(|f| d.join(f).is_file())))
+        .unwrap_or(false)
 }

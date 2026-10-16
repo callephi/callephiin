@@ -8,7 +8,13 @@ use std::net::IpAddr;
 
 const CLIENT_NAME: &str = "callephiin";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEVICE_NAME: &str = "Windows";
+const DEVICE_NAME: &str = if cfg!(target_os = "macos") {
+    "macOS"
+} else if cfg!(target_os = "windows") {
+    "Windows"
+} else {
+    "Linux"
+};
 
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
@@ -312,7 +318,26 @@ pub struct PlayInfo {
     pub transcoding: bool,
     pub start_seconds: f64,
     /// (url, title, language) of external subtitle tracks to load into mpv.
+    /// (url, title, language) of external subtitle tracks to load into mpv.
     pub external_subs: Vec<(String, String, String)>,
+    /// Audio and subtitle streams as the server knows them (a transcode only carries one audio track)
+    pub audio_streams: Vec<StreamInfo>,
+    pub sub_streams: Vec<StreamInfo>,
+    /// Server-side index of the audio track being sent, and of the subtitle burned into the picture
+    pub audio_index: Option<u32>,
+    pub burned_sub: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamInfo {
+    pub index: u32,
+    pub lang: String,
+    pub title: String,
+    pub codec: String,
+    pub default: bool,
+    pub forced: bool,
+    /// Subtitle that mpv can render itself (text); bitmap ones have to be burned in by the server
+    pub text: bool,
 }
 
 /// Trickplay sheet layout for one video
@@ -353,7 +378,7 @@ impl Client {
             base: cfg.server_url.trim_end_matches('/').to_string(),
             token: cfg.access_token.clone(),
             user_id: cfg.user_id.clone(),
-            device_id: cfg.device_id.clone(),
+            device_id: cfg.active_device_id(),
             http: reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -423,6 +448,39 @@ impl Client {
         Ok(self.get(&path)?.json::<ItemsResponse>()?.items)
     }
 
+    /// Shows with the most recently added episodes (by when the episode files were added), newest
+    /// first. Series-level dates are no use here: a metadata refresh bumps them.
+    pub fn updated_items(&self, limit: u32) -> Vec<Item> {
+        let path = format!(
+            "/Users/{}/Items?Recursive=true&IncludeItemTypes=Episode&SortBy=DateCreated&SortOrder=Descending&Limit=300&Fields=SeriesId&EnableImages=false&EnableUserData=false",
+            self.user_id
+        );
+        let eps = self.items(&path);
+        let mut ids: Vec<String> = Vec::new();
+        for e in &eps {
+            if let Some(sid) = &e.series_id {
+                if !ids.contains(sid) {
+                    ids.push(sid.clone());
+                }
+            }
+            if ids.len() >= limit as usize {
+                break;
+            }
+        }
+        if ids.is_empty() {
+            return vec![];
+        }
+        let path = format!(
+            "/Users/{}/Items?Ids={}&Fields={}&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop,Logo",
+            self.user_id,
+            ids.join(","),
+            Self::FIELDS
+        );
+        let mut shows = self.items(&path);
+        shows.sort_by_key(|s| ids.iter().position(|i| *i == s.id).unwrap_or(usize::MAX));
+        shows
+    }
+
     /// Items the user can resume
     pub fn resume_items(&self, limit: u32) -> Result<Vec<Item>> {
         let path = format!(
@@ -477,6 +535,11 @@ impl Client {
     /// Ask the server how to play `item`: Direct Play when allowed and local,
     /// bitrate-capped HLS transcode (H.264/HEVC) otherwise
     pub fn play_info(&self, item: &Item, cfg: &Config) -> Result<PlayInfo> {
+        self.play_info_with(item, cfg, None, None, None)
+    }
+
+    /// `audio` / `sub`: server stream indexes to request (`sub` = -1 for none); `start`: resume point override
+    pub fn play_info_with(&self, item: &Item, cfg: &Config, audio: Option<u32>, sub: Option<i32>, start: Option<f64>) -> Result<PlayInfo> {
         let direct = match cfg.stream_mode {
             StreamMode::AlwaysDirect => true,
             StreamMode::AlwaysTranscode => false,
@@ -489,8 +552,16 @@ impl Client {
             "/Items/{}/PlaybackInfo?UserId={}&StartTimeTicks={}&MaxStreamingBitrate={max_bitrate}&EnableDirectPlay={direct}&EnableDirectStream={direct}&EnableTranscoding=true&AutoOpenLiveStream=true",
             item.id,
             self.user_id,
-            (item.resume_seconds() * 10_000_000.0) as i64
+            (start.unwrap_or_else(|| item.resume_seconds()) * 10_000_000.0) as i64
         );
+        let path = match audio {
+            Some(a) => format!("{path}&AudioStreamIndex={a}"),
+            None => path,
+        };
+        let path = match sub {
+            Some(s) => format!("{path}&SubtitleStreamIndex={s}"),
+            None => path,
+        };
         // a version picked on the page; otherwise the server's own default (its first source)
         let path = match &item.source {
             Some(id) => format!("{path}&MediaSourceId={id}"),
@@ -526,20 +597,52 @@ impl Client {
             return Err(anyhow!("server cannot play or transcode this item"));
         };
 
+        let mut audio_streams = Vec::new();
+        let mut sub_streams = Vec::new();
         let mut external_subs = Vec::new();
         if let Some(streams) = src["MediaStreams"].as_array() {
             for s in streams {
-                if cfg.external_tracks && s["Type"] == "Subtitle" && s["DeliveryMethod"] == "External" {
+                let info = |text: bool| StreamInfo {
+                    index: s["Index"].as_u64().unwrap_or(0) as u32,
+                    lang: s["Language"].as_str().unwrap_or("").to_string(),
+                    title: s["Title"].as_str().unwrap_or("").to_string(),
+                    codec: s["Codec"].as_str().unwrap_or("").to_string(),
+                    default: s["IsDefault"].as_bool().unwrap_or(false),
+                    forced: s["IsForced"].as_bool().unwrap_or(false),
+                    text,
+                };
+                if s["Type"] == "Subtitle" {
+                    log::info!("sub stream #{} lang={} codec={} title={:?} delivery={} url={}", s["Index"], s["Language"].as_str().unwrap_or(""), s["Codec"].as_str().unwrap_or(""), s["DisplayTitle"].as_str().unwrap_or(""), s["DeliveryMethod"].as_str().unwrap_or("-"), s["DeliveryUrl"].as_str().is_some());
+                }
+                match s["Type"].as_str() {
+                    Some("Audio") => audio_streams.push(info(false)),
+                    Some("Subtitle") => sub_streams.push(info(s["IsTextSubtitleStream"].as_bool().unwrap_or(false))),
+                    _ => {}
+                }
+                // only a transcode needs the server's subtitle files (it loses the file's own tracks); on direct
+                // play they would just duplicate the embedded ones
+                if transcoding && s["Type"] == "Subtitle" && s["DeliveryMethod"] == "External" {
                     if let Some(u) = s["DeliveryUrl"].as_str() {
                         let full = if u.starts_with("http") { u.to_string() } else { format!("{}{}", self.base, u) };
                         let sep = if full.contains('?') { '&' } else { '?' };
                         external_subs.push((
                             format!("{full}{sep}api_key={}", self.token),
-                            s["DisplayTitle"].as_str().unwrap_or("Subtitle").to_string(),
+                            s["Title"].as_str().unwrap_or("").to_string(),
                             s["Language"].as_str().unwrap_or("und").to_string(),
                         ));
                     }
                 }
+            }
+        }
+        let audio_index = audio.or(src["DefaultAudioStreamIndex"].as_u64().map(|i| i as u32));
+        let burned_sub = sub.filter(|s| *s >= 0).map(|s| s as u32).filter(|i| sub_streams.iter().any(|x| x.index == *i && !x.text));
+
+        // the audio language wanted in callephiin's settings, when the server picked another one
+        if transcoding && audio.is_none() && !cfg.use_file_default_tracks {
+            let wanted: Vec<String> = cfg.preferred_audio_lang.split(',').map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
+            let pick = wanted.iter().find_map(|w| audio_streams.iter().find(|a| a.lang.to_lowercase() == *w)).map(|a| a.index);
+            if let Some(p) = pick.filter(|p| Some(*p) != audio_index) {
+                return self.play_info_with(item, cfg, Some(p), sub, start);
             }
         }
 
@@ -555,8 +658,12 @@ impl Client {
                 if item.source.is_some() { n.max(2) } else { n.max(item.media_sources.len()) }
             },
             transcoding,
-            start_seconds: item.resume_seconds(),
+            start_seconds: start.unwrap_or_else(|| item.resume_seconds()),
             external_subs,
+            audio_streams,
+            sub_streams,
+            audio_index,
+            burned_sub,
         })
     }
 

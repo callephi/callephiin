@@ -17,6 +17,8 @@ pub struct Player {
     pub render: Arc<Mutex<GlRender>>,
     pub mpv: Mpv,
     pub current: Option<PlayInfo>,
+    /// server-provided subtitle files, added once the file has actually opened
+    pending_subs: std::cell::RefCell<Vec<(String, String, String)>>,
 }
 
 /// Borrowed GL loader handed to mpv while the render context is created
@@ -106,6 +108,7 @@ impl Player {
             render: Arc::new(Mutex::new(GlRender(rc))),
             mpv,
             current: None,
+            pending_subs: Default::default(),
         })
     }
 
@@ -142,16 +145,44 @@ impl Player {
         // Start paused: the app applies remembered tracks first, then un-pauses, so the
         // audio / subtitle reinit happens before the picture starts moving.
         crate::logged!(self.mpv.set_property("pause", true));
-        for (url, title, lang) in &info.external_subs {
-            crate::logged!(self
-                .mpv
-                .command("sub-add", &[url.as_str(), "auto", title.as_str(), lang.as_str()]));
-        }
+        // sub-add straight after loadfile runs before the file is open and is dropped, so queue them
+        *self.pending_subs.borrow_mut() = info
+            .external_subs
+            .iter()
+            .map(|(u, t, l)| (u.clone(), t.clone(), l.clone()))
+            .collect();
         self.current = Some(info);
         Ok(())
     }
 
+    /// Adds the queued subtitle files once the file is open; true when nothing is left to add.
+    /// Only url, flags and title are passed: some mpv builds reject a 4th (lang) argument.
+    pub fn flush_subs(&self) -> bool {
+        if self.pending_subs.borrow().is_empty() {
+            return true;
+        }
+        if self.mpv.get_property::<i64>("track-list/count").unwrap_or(0) == 0 {
+            return false;
+        }
+        for (url, title, lang) in std::mem::take(&mut *self.pending_subs.borrow_mut()) {
+            // libmpv2's command() joins the arguments with spaces and parses the string, so a
+            // title like "English - Default - ASS" must be quoted or it splits into extra args
+            let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+            crate::logged!(self.mpv.command("sub-add", &[q(&url).as_str(), "auto", q(&title).as_str(), q(&lang).as_str()]));
+        }
+        true
+    }
+
+    pub fn play_audio_loop(&mut self, path: &str) {
+        crate::logged!(self.mpv.set_property("loop-file", "inf"));
+        crate::logged!(self.mpv.set_property("start", "0"));
+        let q = format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""));
+        crate::logged!(self.mpv.command("loadfile", &[q.as_str(), "replace"]));
+        crate::logged!(self.mpv.set_property("pause", false));
+    }
+
     pub fn stop(&mut self) {
+        crate::logged!(self.mpv.set_property("loop-file", "no"));
         crate::logged!(self.mpv.command("stop", &[]));
         self.current = None;
     }
@@ -170,6 +201,12 @@ impl Player {
     }
     pub fn volume(&self) -> f64 {
         self.mpv.get_property::<f64>("volume").unwrap_or(100.0)
+    }
+    pub fn muted(&self) -> bool {
+        self.mpv.get_property::<bool>("mute").unwrap_or(false)
+    }
+    pub fn set_muted(&self, m: bool) {
+        crate::logged!(self.mpv.set_property("mute", m));
     }
     pub fn toggle_pause(&self) {
         crate::logged!(self.mpv.set_property("pause", !self.paused()));
@@ -208,6 +245,7 @@ impl Player {
                 codec: get("codec"),
                 selected: flag("selected"),
                 forced: flag("forced"),
+                default: flag("default"),
             });
         }
         out
@@ -242,4 +280,5 @@ pub struct Track {
     pub codec: String,
     pub selected: bool,
     pub forced: bool,
+    pub default: bool,
 }

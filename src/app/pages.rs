@@ -236,6 +236,24 @@ impl App {
     }
 
     /// Mark the open media watched or unwatched (a whole series at once)
+    /// Reload the open page from the server (same request id, so the result lands in this page)
+    fn refresh_title(&mut self, ctx: &egui::Context) {
+        let Some(client) = self.client.clone() else { return };
+        let Some(Detail::Title(v)) = self.detail.last_mut() else { return };
+        if v.loading {
+            return;
+        }
+        v.loading = true;
+        v.error = None;
+        let (req, item, ctx) = (v.req, v.item.clone(), ctx.clone());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = client.load_title(&item).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Title { req, result });
+            ctx.request_repaint();
+        });
+    }
+
     fn toggle_favorite(&mut self, ctx: &egui::Context) {
         let Some(client) = self.client.clone() else { return };
         let Some(Detail::Title(v)) = self.detail.last_mut() else { return };
@@ -348,6 +366,7 @@ impl App {
         let mut hero_play = false;
         let mut hero_toggle = false;
         let mut hero_fav = false;
+        let mut hero_refresh = false;
         let mut watched_ep: Option<Item> = None;
         let next_ep = match self.detail.last() {
             Some(Detail::Title(v)) => v.next_ep.clone(),
@@ -366,7 +385,7 @@ impl App {
         }
         area.show(ui, |ui| {
             let mut hero_item = item.clone();
-            let mut opts = ui::HeroOpts { back: true, watch_button: true, played: item.played(), favorite: Some(item.user_data.as_ref().map_or(false, |u| u.is_favorite)), link_title: item.kind == "Episode", ..Default::default() };
+            let mut opts = ui::HeroOpts { back: true, watch_button: true, played: item.played(), favorite: Some(item.user_data.as_ref().map_or(false, |u| u.is_favorite)), link_title: item.kind == "Episode", refresh: item.kind == "Movie", ..Default::default() };
             if is_series {
                 opts.play_label = next_ep.as_ref().and_then(|e| e.ep_code()).map(|c| format!("Play {c}"));
                 // an episode in progress turns the button into "Resume S1:E10 from 10:01"
@@ -398,6 +417,7 @@ impl App {
             hero_play = act.play;
             hero_toggle = act.toggle_watched;
             hero_fav = act.toggle_favorite;
+            hero_refresh = act.refresh;
             if act.open_title {
                 open = Some(item.series_stub());
             }
@@ -418,6 +438,7 @@ impl App {
                     Sel::Season(id) => seasons.iter().find(|x| &x.id == id).map(|x| x.name.clone()).unwrap_or_default(),
                     Sel::Extras => "Extras".to_string(),
                 };
+                ui.horizontal(|ui| {
                 if multi {
                     let btn = ui::dropdown_button(ui, &ui::ellipsize(&cur_name, 70), 17.0 * s);
                     if btn.clicked() {
@@ -476,8 +497,13 @@ impl App {
                         }
                     }
                 } else {
-                    ui.label(RichText::new("Episodes").size(18.0 * s).strong());
+                    let heading = if matches!(sel, Sel::Season(_)) { ui::episodes_heading(&seasons) } else { "Episodes".to_string() };
+                    ui.label(RichText::new(heading).size(18.0 * s).strong());
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        hero_refresh |= ui::icon_button(ui, ui::Icon::Refresh, 30.0 * s, !loading).on_hover_text("Refresh").clicked();
+                    });
+                });
                 ui.add_space(8.0 * s);
 
                 if cats == 0 {
@@ -540,7 +566,12 @@ impl App {
                     versions_row(ui, &client, &item, &vmem, s, &mut play, &mut hover, &mut open, &mut watched_ep, &spoil);
                 }
                 if !episodes.is_empty() {
-                    ui.label(RichText::new("Episodes").size(18.0 * s).strong());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Episodes").size(18.0 * s).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            hero_refresh |= ui::icon_button(ui, ui::Icon::Refresh, 30.0 * s, !loading).on_hover_text("Refresh").clicked();
+                    });
+                    });
                     ui.add_space(8.0 * s);
                     ui::tile_row(ui, &client, &episodes, s, "title_eps_ep", TileMode::Episode, &mut play, &mut hover, &mut open, &mut watched_ep, &spoil);
                     ui.add_space(14.0 * s);
@@ -620,6 +651,9 @@ impl App {
             if let Some(Detail::Title(v)) = self.detail.last_mut() {
                 v.focus = None;
             }
+        }
+        if hero_refresh {
+            self.refresh_title(ctx);
         }
         if hero_fav {
             self.toggle_favorite(ctx);

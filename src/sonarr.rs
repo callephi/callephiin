@@ -108,3 +108,46 @@ pub fn lookup(url: &str, key: &str, tvdb: Option<&str>, title: &str) -> Result<O
     aka.truncate(6);
     Ok(Some(Info { next, aka }))
 }
+
+/// One upcoming episode on the calendar.
+#[derive(Clone, Debug)]
+pub struct CalEntry {
+    pub show: String,
+    pub season: u32,
+    pub episode: u32,
+    /// Day it airs (local day when the time is known, Sonarr's air date otherwise)
+    pub date: chrono::NaiveDate,
+    /// Local air time; `None` when Sonarr doesn't know it
+    pub time: Option<chrono::NaiveTime>,
+}
+
+/// Episodes airing from `start` to `end` (inclusive) for the shows Sonarr monitors.
+pub fn calendar(url: &str, key: &str, start: chrono::NaiveDate, end: chrono::NaiveDate) -> Result<Vec<CalEntry>, String> {
+    let end = end + chrono::Duration::days(1);
+    let v = get(url, key, &format!("/api/v3/calendar?start={start}&end={end}&includeSeries=true"))?;
+    let mut out = Vec::new();
+    for e in v.as_array().into_iter().flatten() {
+        let (Some(season), Some(episode)) = (e["seasonNumber"].as_u64(), e["episodeNumber"].as_u64()) else { continue };
+        let show = e["series"]["title"].as_str().unwrap_or("").to_string();
+        if show.is_empty() {
+            continue;
+        }
+        // a time only counts when the series has an air time; otherwise Sonarr's UTC value is a guess
+        let has_time = e["series"]["airTime"].as_str().map_or(false, |t| !t.trim().is_empty());
+        let utc = e["airDateUtc"].as_str().and_then(|d| DateTime::parse_from_rfc3339(d).ok());
+        let (date, time) = match (utc, has_time) {
+            (Some(u), true) => {
+                let l = u.with_timezone(&Local);
+                (l.date_naive(), Some(l.time()))
+            }
+            _ => match e["airDate"].as_str().and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()) {
+                Some(d) => (d, None),
+                None => continue,
+            },
+        };
+        out.push(CalEntry { show, season: season as u32, episode: episode as u32, date, time });
+    }
+    out.sort_by(|a, b| (a.date, a.time, &a.show).cmp(&(b.date, b.time, &b.show)));
+    log::debug!("sonarr calendar {start}..{end}: {} episode(s)", out.len());
+    Ok(out)
+}

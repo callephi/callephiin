@@ -1,11 +1,17 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod app;
+mod backup;
 mod config;
 mod debuglog;
 mod discord;
+mod egg;
+mod egg_gif;
 mod imgloader;
 mod sonarr;
+
+/// Release codename, set in Cargo.toml (`[package.metadata.callephiin]`) or via CALLEPHIIN_CODENAME.
+pub const VERSION_NAME: &str = env!("CALLEPHIIN_CODENAME");
 use debuglog::LogOk;
 mod jellyfin;
 mod player;
@@ -37,7 +43,14 @@ fn main() -> eframe::Result<()> {
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
     }
+    let cfg = config::Config::load();
+    log::info!("diagnostics: vsync={} skip_mpv={} angle={}", cfg.vsync, cfg.skip_mpv, cfg.angle);
+    // a partial set of libraries would stop the program from opening, so ANGLE needs all of them
+    if cfg.angle && config::angle_libs_present() {
+        std::env::set_var("CALLEPHIIN_GL_API", "angle");
+    }
     let options = eframe::NativeOptions {
+        vsync: cfg.vsync,
         viewport,
         renderer: eframe::Renderer::Glow,
         // always open at the default 720p-sized window, centred (not at whatever size it was closed at)

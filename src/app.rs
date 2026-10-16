@@ -1,3 +1,4 @@
+mod calendar;
 mod pages;
 mod profiles;
 use crate::debuglog::LogOk;
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 enum Tab {
     Home,
     Search,
+    Calendar,
     Settings,
 }
 
@@ -31,7 +33,7 @@ enum Skip {
 
 enum Msg {
     Login(Result<Config, String>),
-    Home { suggested: Vec<Item>, latest: Vec<Item>, resume: Vec<Item>, next_up: Vec<Item>, libraries: Vec<Item>, admin: bool, version: String },
+    Home { suggested: Vec<Item>, updated: Vec<Item>, latest: Vec<Item>, resume: Vec<Item>, next_up: Vec<Item>, libraries: Vec<Item>, admin: bool, version: String },
     /// One page of a library (`req` identifies the request so stale answers are dropped)
     Library { req: u64, result: Result<(Vec<Item>, usize), String> },
     Title { req: u64, result: Result<TitleData, String> },
@@ -41,6 +43,9 @@ enum Msg {
     SonarrTest(Result<String, String>),
     TitleSeason { req: u64, season_id: String, episodes: Vec<Item>, extras: Vec<Item> },
     Person { req: u64, items: Vec<Item> },
+    Backup(Result<String, String>),
+    ConfigImported(Result<usize, String>),
+    Calendar { req: u64, result: Result<Vec<crate::sonarr::CalEntry>, String> },
     TitleRefresh { req: u64, item: Item, next: Option<Item>, episodes: Vec<Item> },
     Search { req: u64, query: String, results: SearchResults },
     Error(String),
@@ -79,6 +84,8 @@ struct PlayerActions {
     remember_audio: Option<Track>,
     remember_sub: Option<Option<Track>>,
     open_series: Option<Item>,
+    /// transcoding only: restart the stream with another audio track / burned-in subtitle (-1 = none)
+    reload: Option<(Option<u32>, Option<i32>)>,
 }
 
 pub struct App {
@@ -89,6 +96,7 @@ pub struct App {
     server_version: String,
 
     latest: Vec<Item>,
+    updated: Vec<Item>,
     suggested: Vec<Item>,
     resume: Vec<Item>,
     next_up: Vec<Item>,
@@ -103,6 +111,11 @@ pub struct App {
     selected: Option<Item>,
     /// Result of the last Sonarr "Test" press (None while untested or testing)
     sonarr_test: Option<Result<String, String>>,
+    cal: calendar::CalState,
+    egg: Option<crate::egg::Egg>,
+    img_tracker: Arc<crate::imgloader::TrackingTextures>,
+    last_sweep: Instant,
+    backup_note: Option<Result<String, String>>,
     /// Items already re-fetched because the hero had no artwork
     enriched: std::collections::HashSet<String>,
     status: String,
@@ -134,6 +147,7 @@ pub struct App {
     prev_ep: Option<Item>,
     last_skip: Option<Skip>,
     audio_tracks: Vec<Track>,
+    jf_image_subs: Vec<Track>,
     sub_tracks: Vec<Track>,
     tracks_at: Instant,
     trick: Option<Trick>,
@@ -166,12 +180,18 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         cc.egui_ctx.add_bytes_loader(Arc::new(crate::imgloader::LoggingHttp::new()));
+        crate::imgloader::reset_cache();
+        // once a texture exists, egui drops its copies of the encoded and decoded image
+        cc.egui_ctx.options_mut(|o| o.reduce_texture_memory = true);
+        let img_tracker = Arc::new(crate::imgloader::TrackingTextures::new());
+        cc.egui_ctx.add_texture_loader(img_tracker.clone());
         apply_theme(&cc.egui_ctx);
 
         let cfg = Config::load();
         let (tx, rx) = channel();
 
         let (player, player_error) = match cc.get_proc_address {
+            _ if cfg.skip_mpv => (None, Some("mpv player disabled (skip_mpv in config.json)".to_string())),
             Some(loader) => {
                 let ctx = cc.egui_ctx.clone();
                 match Player::new(&cfg, loader, move || ctx.request_repaint()) {
@@ -194,6 +214,7 @@ impl App {
             admin: false,
             server_version: String::new(),
             latest: vec![],
+            updated: vec![],
             suggested: vec![],
             resume: vec![],
             next_up: vec![],
@@ -207,6 +228,11 @@ impl App {
             custom_scale_text: String::new(),
             selected: None,
             sonarr_test: None,
+            cal: calendar::CalState::new(),
+            egg: None,
+            img_tracker,
+            last_sweep: Instant::now(),
+            backup_note: None,
             enriched: Default::default(),
             status: String::new(),
             busy: false,
@@ -230,6 +256,7 @@ impl App {
             prev_ep: None,
             last_skip: None,
             audio_tracks: vec![],
+            jf_image_subs: vec![],
             sub_tracks: vec![],
             tracks_at: Instant::now(),
             trick: None,
@@ -291,6 +318,7 @@ impl App {
         match (client.home_items(40), client.resume_items(12)) {
             (Ok(latest), resume) => Msg::Home {
                 suggested: client.suggested(24),
+                updated: client.updated_items(24),
                 latest,
                 resume: resume.unwrap_or_default(),
                 next_up: client.next_up_items(16),
@@ -319,6 +347,7 @@ impl App {
         let mut cfg = self.cfg.clone();
         cfg.server_url = self.form_url.trim().to_string();
         cfg.username = self.form_user.trim().to_string();
+        cfg.login_device_id = Some(cfg.device_id_for_login(&cfg.server_url, &cfg.username));
         let pw = self.password.clone();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         self.busy = true;
@@ -489,8 +518,9 @@ impl App {
                     self.busy = false;
                     self.status = e;
                 }
-                Msg::Home { suggested, latest, resume, next_up, libraries, admin, version } => {
+                Msg::Home { suggested, updated, latest, resume, next_up, libraries, admin, version } => {
                     self.suggested = suggested;
+                    self.updated = updated;
                     self.busy = false;
                     self.server_version = version;
                     self.admin = admin;
@@ -549,6 +579,31 @@ impl App {
                     }
                     self.sonarr_test = Some(r);
                 }
+                Msg::Backup(r) => self.backup_note = Some(r),
+                Msg::ConfigImported(r) => match r {
+                    Ok(n) => {
+                        log::debug!("config import: {n} file(s) restored, reloading");
+                        self.cfg = Config::load();
+                        self.discord_enabled.store(self.cfg.discord_enabled, Ordering::Relaxed);
+                        self.custom_scale_text.clear();
+                        self.client = (self.cfg.logged_in() && !(self.cfg.switcher_on_launch && !self.cfg.profiles.is_empty())).then(|| Client::from_config(&self.cfg));
+                        self.reset_session();
+                        self.tab = Tab::Home;
+                        self.view = if self.client.is_some() {
+                            View::Normal
+                        } else if self.cfg.profiles.is_empty() {
+                            View::Add
+                        } else {
+                            View::Switcher
+                        };
+                        if self.client.is_some() {
+                            self.refresh_home(ctx);
+                        }
+                        self.backup_note = Some(Ok("Config imported".into()));
+                    }
+                    Err(e) => self.backup_note = Some(Err(e)),
+                },
+                Msg::Calendar { req, result } => self.on_calendar(req, result),
                 Msg::TitleSeason { req, season_id, episodes, extras } => self.on_title_season(req, season_id, episodes, extras),
                 Msg::TitleRefresh { req, item, next, episodes } => self.on_title_refresh(req, item, next, episodes),
                 Msg::Person { req, items } => self.on_person_loaded(req, items),
@@ -571,6 +626,15 @@ impl App {
                 }
                 Msg::Play(Ok(info)) => {
                     self.status.clear();
+                    if self.player.is_some() && crate::egg::roll() {
+                        if let (Some(egg), Some(audio)) = (crate::egg::Egg::new(ctx), crate::egg::audio_file()) {
+                            if let Some(p) = self.player.as_mut() {
+                                p.play_audio_loop(&audio);
+                            }
+                            self.egg = Some(egg);
+                            continue;
+                        }
+                    }
                     if let Some(p) = self.player.as_mut() {
                         p.apply_track_prefs(self.cfg.use_file_default_tracks, &self.cfg.preferred_sub_lang, &self.cfg.preferred_audio_lang);
                         if let Err(e) = p.load(info.clone()) {
@@ -583,6 +647,7 @@ impl App {
                             self.prev_ep = None;
                             self.last_skip = None;
                             self.audio_tracks.clear();
+                            self.jf_image_subs.clear();
                             self.sub_tracks.clear();
                             self.trick = None;
                             self.trick_tiles.clear();
@@ -654,7 +719,79 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        let c = BG;
+        [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::imgloader::clear_cache();
+    }
+
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        use egui_glow::glow::HasContext;
+        // like mpv's own Windows backend: with swap interval 0, wait for the compositor right after the
+        // previous frame was presented (the swap happens when update() returns), so the next frame
+        // is drawn and presented in step with the display instead of landing mid-refresh
+        if self.cfg.dwm_flush && !self.cfg.vsync {
+            dwm_flush();
+        }
+        static INFO: std::sync::Once = std::sync::Once::new();
+        if let Some(gl) = frame.gl() {
+            INFO.call_once(|| unsafe {
+                let (vendor, renderer, version) = (
+                    gl.get_parameter_string(egui_glow::glow::VENDOR),
+                    gl.get_parameter_string(egui_glow::glow::RENDERER),
+                    gl.get_parameter_string(egui_glow::glow::VERSION),
+                );
+                log::info!("gl: vendor={vendor:?} renderer={renderer:?} version={version:?}");
+                let _ = GL_INFO.set(format!("{renderer} - {version}"));
+            });
+        }
+        if self.last_sweep.elapsed() >= Duration::from_secs(5) {
+            self.last_sweep = Instant::now();
+            self.img_tracker.sweep(ctx);
+            crate::ui::trim_caches();
+        }
+        self.update_inner(ctx);
+        let finish = self.cfg.gl_finish;
+        let cb = egui_glow::CallbackFn::new(move |_info, painter| {
+            let gl = painter.gl();
+            unsafe {
+                if finish {
+                    gl.finish();
+                }
+                static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                loop {
+                    let e = gl.get_error();
+                    if e == 0 {
+                        break;
+                    }
+                    if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                        log::debug!("gl error 0x{e:x} at end of frame");
+                    }
+                }
+            }
+        });
+        let screen = ctx.screen_rect();
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Debug, egui::Id::new("frame_end")))
+            .add(egui::PaintCallback { rect: screen, callback: Arc::new(cb) });
+    }
+}
+
+impl App {
+    fn update_inner(&mut self, ctx: &egui::Context) {
+        // log frames whose UI work took unusually long (helps track down stutter / flashes)
+        struct Slow(Instant);
+        impl Drop for Slow {
+            fn drop(&mut self) {
+                let ms = self.0.elapsed().as_millis();
+                if ms > 60 {
+                    log::debug!("slow frame: update took {ms} ms");
+                }
+            }
+        }
+        let _slow = Slow(Instant::now());
         // remember the normal window geometry (not maximized, not "fullscreen") for set_fullscreen
         if !is_fullscreen(ctx) {
             let (outer, inner, maxed, min) = ctx.input(|i| {
@@ -708,6 +845,13 @@ impl eframe::App for App {
             }
         }
 
+        if let Some(egg) = &self.egg {
+            if egg.ui(ctx) {
+                self.egg = None;
+                self.stop_playback(ctx);
+            }
+            return;
+        }
         let playing = self.player.as_ref().map_or(false, |p| p.current.is_some());
         if playing {
             self.player_ui(ctx);
@@ -755,6 +899,11 @@ impl eframe::App for App {
                         self.go_tab(Tab::Search);
                     }
                     ui.add_space(6.0);
+                    if ui::nav_button(ui, "calendar", "Calendar", self.tab == Tab::Calendar, 62.0, t) {
+                        self.go_tab(Tab::Calendar);
+                        self.calendar_open(ctx);
+                    }
+                    ui.add_space(6.0);
                     if ui::nav_button(ui, "⚙", "Settings", self.tab == Tab::Settings, 62.0, t) {
                         self.go_tab(Tab::Settings);
                     }
@@ -782,6 +931,7 @@ impl eframe::App for App {
                 match self.tab {
                     Tab::Home | Tab::Search if !self.detail.is_empty() => self.detail_ui(ui, ctx, s),
                     Tab::Search => self.search_ui(ui, ctx, s),
+                    Tab::Calendar => self.calendar_ui(ui, ctx, s),
                     Tab::Home if self.library.is_some() => self.library_ui(ui, ctx, s),
                     Tab::Home => self.home_ui(ui, ctx, s),
                     Tab::Settings => self.settings_ui(ui, ctx, s),
@@ -802,10 +952,28 @@ fn toggle_play(player: &Player, started: bool, hold: &mut bool) {
 }
 
 /// Height of four rows in a track menu (measured from the real row height)
+/// Blocks until the Windows desktop compositor's next refresh, which paces frames to the display
+/// without a GL swap interval (the swap interval is what caused the black flashes).
+#[cfg(windows)]
+fn dwm_flush() {
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmFlush() -> i32;
+    }
+    unsafe {
+        DwmFlush();
+    }
+}
+#[cfg(not(windows))]
+fn dwm_flush() {}
+
+/// "renderer - version" of the GL context in use (shows whether ANGLE or the native driver drew)
+static GL_INFO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn track_list_h(ui: &egui::Ui) -> f32 {
     let text = ui.text_style_height(&egui::TextStyle::Button);
     let row = ui.spacing().interact_size.y.max(text + 2.0 * ui.spacing().button_padding.y);
-    (row + ui.spacing().item_spacing.y) * 4.0
+    (row + ui.spacing().item_spacing.y) * 8.0
 }
 
 impl App {
@@ -815,6 +983,7 @@ impl App {
         let mut play: Option<Item> = None;
         let mut hover: Option<Item> = None;
         let mut open_lib: Option<Item> = None;
+        let mut refresh = false;
         let mut watched: Option<Item> = None;
         let mut open_title: Option<Item> = None;
         let mut open_item: Option<Item> = None;
@@ -844,13 +1013,27 @@ impl App {
             ui.add_space(18.0 * s);
 
             if !self.resume.is_empty() {
-                ui.label(RichText::new("Continue watching").size(18.0 * s).strong());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Continue watching").size(18.0 * s).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        refresh = ui::icon_button(ui, ui::Icon::Refresh, 30.0 * s, !self.busy).on_hover_text("Refresh").clicked();
+                    });
+                });
                 ui.add_space(8.0 * s);
                 ui::resume_row(ui, &client, &self.resume, s, "resume_row", &mut play, &mut hover, &mut watched, &mut open_item, false);
                 ui.add_space(18.0 * s);
             }
             if !self.next_up.is_empty() {
-                ui.label(RichText::new("Next up").size(18.0 * s).strong());
+                if self.resume.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Next up").size(18.0 * s).strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            refresh = ui::icon_button(ui, ui::Icon::Refresh, 30.0 * s, !self.busy).on_hover_text("Refresh").clicked();
+                        });
+                    });
+                } else {
+                    ui.label(RichText::new("Next up").size(18.0 * s).strong());
+                }
                 ui.add_space(8.0 * s);
                 ui::resume_row(ui, &client, &self.next_up, s, "next_up_row", &mut play, &mut hover, &mut watched, &mut open_item, self.cfg.spoiler_control);
                 ui.add_space(18.0 * s);
@@ -859,6 +1042,12 @@ impl App {
                 ui.label(RichText::new("Libraries").size(18.0 * s).strong());
                 ui.add_space(8.0 * s);
                 ui::library_row(ui, &client, &self.libraries, s, &mut open_lib);
+                ui.add_space(18.0 * s);
+            }
+            if !self.updated.is_empty() {
+                ui.label(RichText::new("Recently updated").size(18.0 * s).strong());
+                ui.add_space(8.0 * s);
+                ui::poster_row(ui, &client, &self.updated, s, "updated_row", &mut open_title, &mut hover);
                 ui.add_space(18.0 * s);
             }
             ui.label(RichText::new("Recently added").size(18.0 * s).strong());
@@ -899,6 +1088,9 @@ impl App {
                     }
                 });
             }
+        }
+        if refresh {
+            self.refresh_home(ctx);
         }
         if let Some(lib) = open_lib {
             self.open_library(lib, ctx);
@@ -1185,7 +1377,6 @@ impl App {
                     ui.label(RichText::new("Press Enter to apply.").color(MUTED));
                 }
                 ui.add_space(6.0 * s);
-                ui.checkbox(&mut self.cfg.external_tracks, "Load external (sidecar) subtitle and audio files");
             });
 
             ui::section(ui, "Discord", s, |ui| {
@@ -1240,6 +1431,37 @@ impl App {
                 });
                 ui.add_space(6.0 * s);
                 ui.checkbox(&mut self.cfg.switcher_on_launch, "Always show the profile switcher at launch");
+                ui.add_space(6.0 * s);
+                ui.horizontal(|ui| {
+                    if ui.button("Export config").clicked() {
+                        self.backup_note = None;
+                        self.cfg.save();
+                        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            let r = crate::backup::export().map(|p| format!("Exported to {}", p.display()));
+                            let _ = tx.send(Msg::Backup(r));
+                            ctx.request_repaint();
+                        });
+                    }
+                    if ui.button("Import config").clicked() {
+                        self.backup_note = None;
+                        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            if let Some(p) = crate::backup::pick_zip() {
+                                let _ = tx.send(Msg::ConfigImported(crate::backup::import(&p)));
+                                ctx.request_repaint();
+                            }
+                        });
+                    }
+                    let note = |ui: &mut egui::Ui, m: &str, c: Color32| {
+                        ui.add(egui::Label::new(RichText::new(m).color(c)).truncate()).on_hover_text(m);
+                    };
+                    match &self.backup_note {
+                        Some(Ok(m)) => note(ui, m, Color32::from_rgb(110, 200, 130)),
+                        Some(Err(e)) => note(ui, e, Color32::LIGHT_RED),
+                        None => {}
+                    }
+                });
             });
             ui.add_space(18.0 * s);
             ui::section(ui, "Diagnostics", s, |ui| {
@@ -1249,8 +1471,35 @@ impl App {
                 if let Some(p) = crate::debuglog::path() {
                     ui.label(RichText::new(format!("Output folder: {}", p.parent().unwrap_or(&p).display())).small().color(MUTED));
                 }
+                ui.add_space(4.0 * s);
+                if cfg!(windows) {
+                    let angle_ok = crate::config::angle_libs_present();
+                    ui.add_enabled_ui(angle_ok, |ui| {
+                        // the saved choice is kept while the libraries are missing, so ANGLE comes back by itself when they return
+                        let mut on = self.cfg.angle && angle_ok;
+                        if ui.checkbox(&mut on, "Use ANGLE (Direct3D 11) renderer on Windows (restart required)").changed() {
+                            self.cfg.angle = on;
+                        }
+                    });
+                    if !angle_ok {
+                        ui.label(RichText::new("libEGL.dll, libGLESv2.dll and d3dcompiler_47.dll must all be next to callephiin.exe; using the native OpenGL driver.").small().color(MUTED));
+                    }
+                }
+                ui.label(RichText::new(format!("Drawing with: {}", GL_INFO.get().map_or("unknown", |s| s.as_str()))).small().color(MUTED));
+                ui.checkbox(&mut self.cfg.vsync, "V-Sync (restart required)");
+                if cfg!(windows) {
+                    ui.label(RichText::new("Stops video tearing. With the ANGLE renderer this is safe to turn on. With the native OpenGL driver on an NVIDIA card it can flicker black unless \"Vulkan/OpenGL present method\" is \"Prefer native\" for callephiin.exe in the NVIDIA Control Panel.").small().color(MUTED));
+                }
+                ui.add_space(4.0 * s);
+                if ui.button("Open callephiin data folder").clicked() {
+                    if let Some(dir) = crate::backup::root() {
+                        crate::logged!(std::fs::create_dir_all(&dir));
+                        let opener = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                        crate::logged!(std::process::Command::new(opener).arg(&dir).spawn());
+                    }
+                }
             });
-            ui.hyperlink_to(format!("callephiin v{} | developed by callephi", env!("CARGO_PKG_VERSION")), "https://github.com/callephi/callephiin");
+            ui.hyperlink_to(format!("callephiin v{} {} | developed by callephi", env!("CARGO_PKG_VERSION"), crate::VERSION_NAME), "https://github.com/callephi/callephiin");
             ui.add_space(12.0 * s);
         });
 
@@ -1262,6 +1511,25 @@ impl App {
     }
 
     // ------------------------------------------------------------------------ player
+
+    /// Transcoded streams carry one audio track and burn bitmap subtitles in: ask the server for another
+    /// combination and carry on from the current position.
+    fn reload_stream(&mut self, ctx: &egui::Context, audio: Option<u32>, sub: Option<i32>) {
+        let (Some(p), Some(client)) = (self.player.as_ref(), self.client.clone()) else { return };
+        let Some(info) = p.current.clone() else { return };
+        let pos = p.position();
+        let mut item = info.item.clone();
+        item.source = Some(info.media_source_id.clone());
+        let audio = audio.or(info.audio_index);
+        let sub = sub.or(info.burned_sub.map(|i| i as i32));
+        let (cfg, tx, ctx) = (self.cfg.clone(), self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            client.report_stopped(&info, pos);
+            let r = client.play_info_with(&item, &cfg, audio, sub, Some(pos)).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Play(r));
+            ctx.request_repaint();
+        });
+    }
 
     fn apply_actions(&mut self, ctx: &egui::Context, a: PlayerActions) {
         if let Some(series) = a.open_series.clone() {
@@ -1324,6 +1592,9 @@ impl App {
                 }
             }
         }
+        if let Some((audio, sub)) = a.reload {
+            self.reload_stream(ctx, audio, sub);
+        }
         if a.back {
             self.stop_playback(ctx);
         }
@@ -1354,7 +1625,11 @@ impl App {
 
         // --- sync Discord + server progress -----------------------------------------
         let pos = player.position();
-        let dur = player.duration();
+        // the item's own runtime: mpv reports a growing or placeholder length while a stream is still opening
+        let dur = match info.item.run_time_ticks {
+            Some(t) if t > 0 => t as f64 / 1e7,
+            _ => player.duration(),
+        };
         let paused = if self.started { player.paused() } else { self.user_hold };
         if let Ok(mut g) = self.discord_now.lock() {
             let item = &info.item;
@@ -1394,17 +1669,34 @@ impl App {
             Duration::from_secs(1)
         };
         if self.tracks_at.elapsed() >= refresh_every {
-            self.audio_tracks = player.tracks(TrackKind::Audio);
             self.sub_tracks = player.tracks(TrackKind::Sub);
+            if info.transcoding {
+                let track = |s: &crate::jellyfin::StreamInfo, selected: bool, id: i64| Track { id, lang: s.lang.clone(), title: s.title.clone(), codec: s.codec.clone(), selected, forced: s.forced, default: s.default };
+                self.audio_tracks = info.audio_streams.iter().map(|s| track(s, Some(s.index) == info.audio_index, s.index as i64)).collect();
+                self.jf_image_subs = info.sub_streams.iter().filter(|s| !s.text).map(|s| track(s, Some(s.index) == info.burned_sub, s.index as i64)).collect();
+            } else {
+                self.audio_tracks = player.tracks(TrackKind::Audio);
+            }
             self.tracks_at = Instant::now();
         }
         let waited = self.play_started.elapsed();
-        if !self.tracks_applied && ((!self.audio_tracks.is_empty() && waited > Duration::from_millis(400)) || waited > Duration::from_secs(6)) {
+        let subs_ready = player.flush_subs() || waited > Duration::from_secs(6);
+        if subs_ready && !self.tracks_applied && ((!self.audio_tracks.is_empty() && waited > Duration::from_millis(400)) || waited > Duration::from_secs(6)) {
             self.tracks_applied = true;
+            // several tracks flagged Default: prefer the forced ones, English first
+            if self.cfg.use_file_default_tracks {
+                if let Some(id) = pick_default(&self.audio_tracks).filter(|_| !info.transcoding) {
+                    player.set_audio(id);
+                }
+                if let Some(id) = pick_default(&self.sub_tracks) {
+                    player.set_sub(Some(id));
+                }
+                self.tracks_at = Instant::now() - Duration::from_secs(60);
+            }
             if self.cfg.remember_tracks {
                 let series = info.item.series_id.clone().filter(|_| info.item.is_episode());
                 if let Some(pref) = series.and_then(|s| self.cfg.series_tracks.get(&s).cloned()) {
-                    if let Some(id) = pref.audio.as_ref().and_then(|w| find_match(&self.audio_tracks, w)) {
+                    if let Some(id) = pref.audio.as_ref().and_then(|w| find_match(&self.audio_tracks, w)).filter(|_| !info.transcoding) {
                         player.set_audio(id);
                     }
                     if pref.sub_off {
@@ -1645,7 +1937,7 @@ impl App {
                     let inner = panel_rect.shrink(16.0);
                     ui.allocate_new_ui(UiBuilder::new().max_rect(inner), |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Episodes").size(20.0).strong());
+                            ui.label(RichText::new(ui::episodes_heading(&seasons)).size(20.0).strong());
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui::cross_button(ui, 34.0).clicked() {
                                     act.toggle_panel = true;
@@ -1711,6 +2003,8 @@ impl App {
         let mut volume = player.volume();
         let audio_tracks = self.audio_tracks.clone();
         let sub_tracks = self.sub_tracks.clone();
+        let image_subs = self.jf_image_subs.clone();
+        let burned = info.burned_sub;
         let marks: Vec<SeekMark> = self
             .segments
             .iter()
@@ -1787,25 +2081,38 @@ impl App {
 
                         // Subtitle list
                         let sub_btn = ui::icon_button(ui, Icon::Subtitles, 36.0, true);
-                        let sub_id = egui::Id::new("subtitle_menu");
+                        let sub_id = egui::Id::new(("subtitle_menu", info.item.id.clone()));
                         if sub_btn.clicked() { ui.memory_mut(|m| m.toggle_popup(sub_id)); }
                         egui::popup_above_or_below_widget(ui, sub_id, &sub_btn, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                             ui.set_width(300.0);
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                             ui.label(RichText::new("Subtitles").strong());
                             ui.separator();
-                            let none_selected = !sub_tracks.iter().any(|t| t.selected);
+                            let none_selected = !sub_tracks.iter().any(|t| t.selected) && burned.is_none();
                             egui::ScrollArea::vertical().max_height(track_list_h(ui)).show(ui, |ui| {
                                 if ui.selectable_label(none_selected, "Off").clicked() {
-                                    player.set_sub(None);
+                                    if burned.is_some() {
+                                        act.reload = Some((None, Some(-1)));
+                                    } else {
+                                        player.set_sub(None);
+                                    }
                                     act.remember_sub = Some(None);
                                     refresh_tracks = true;
                                 }
                                 for t in &sub_tracks {
-                                    if ui.selectable_label(t.selected, ui::track_label(t)).on_hover_text(ui::track_label(t)).clicked() {
+                                    if ui.selectable_label(t.selected && burned.is_none(), ui::sub_label(t)).on_hover_text(ui::sub_label(t)).clicked() {
+                                        if burned.is_some() {
+                                            act.reload = Some((None, Some(-1)));
+                                        }
                                         player.set_sub(Some(t.id));
                                         act.remember_sub = Some(Some(t.clone()));
                                         refresh_tracks = true;
+                                    }
+                                }
+                                for t in &image_subs {
+                                    let label = format!("{} (burned in)", ui::sub_label(t));
+                                    if ui.selectable_label(t.selected, &label).on_hover_text(&label).clicked() {
+                                        act.reload = Some((None, Some(t.id as i32)));
                                     }
                                 }
                             });
@@ -1813,7 +2120,7 @@ impl App {
 
                         // Audio list
                         let aud_btn = ui::icon_button(ui, Icon::Audio, 36.0, true);
-                        let aud_id = egui::Id::new("audio_menu");
+                        let aud_id = egui::Id::new(("audio_menu", info.item.id.clone()));
                         if aud_btn.clicked() { ui.memory_mut(|m| m.toggle_popup(aud_id)); }
                         egui::popup_above_or_below_widget(ui, aud_id, &aud_btn, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                             ui.set_width(300.0);
@@ -1826,8 +2133,12 @@ impl App {
                             egui::ScrollArea::vertical().max_height(track_list_h(ui)).show(ui, |ui| {
                                 for t in &audio_tracks {
                                     if ui.selectable_label(t.selected, ui::track_label(t)).on_hover_text(ui::track_label(t)).clicked() {
-                                        player.set_audio(t.id);
-                                        act.remember_audio = Some(t.clone());
+                                        if info.transcoding {
+                                            act.reload = Some((Some(t.id as u32), None));
+                                        } else {
+                                            player.set_audio(t.id);
+                                            act.remember_audio = Some(t.clone());
+                                        }
                                         refresh_tracks = true;
                                     }
                                 }
@@ -1848,13 +2159,21 @@ impl App {
                                 act.toggle_panel = true;
                             }
                             // volume: speaker icon; the slider (and percentage) appears while hovering it
-                            let vol_icon = ui::icon_button(ui, Icon::Volume, 34.0, true);
+                            let muted = player.muted();
+                            let vol_icon = ui::icon_button(ui, if muted { Icon::Muted } else { Icon::Volume }, 34.0, true);
+                            if vol_icon.clicked() {
+                                player.set_muted(!muted);
+                            }
                             let mut area = vol_icon.rect;
                             if self.vol_hot || vol_icon.hovered() {
-                                ui.add_sized(vec2(44.0, 24.0), egui::Label::new(RichText::new(format!("{}%", volume.round() as i64)).color(Color32::from_gray(220))));
+                                let shown = if muted { "Muted".to_string() } else { format!("{}%", volume.round() as i64) };
+                                ui.add_sized(vec2(44.0, 24.0), egui::Label::new(RichText::new(shown).color(Color32::from_gray(220))));
                                 let (changed, sr) = ui::volume_slider(ui, &mut volume, 130.0, 120.0);
                                 if changed {
                                     player.set_volume(volume);
+                                    if muted {
+                                        player.set_muted(false);
+                                    }
                                 }
                                 area = area.union(sr.rect);
                             }
@@ -1878,11 +2197,39 @@ impl App {
 
 /// "Fullscreen" is a borderless window the size of the monitor (one pixel row taller, hanging off the bottom edge, so Windows
 /// does not promote it to exclusive fullscreen, which made video flash black on seeks).
+/// With more than one Default track, choose among the forced ones (or all Defaults if none is
+/// forced), English first. `None` means leave mpv's own pick alone.
+fn pick_default(tracks: &[Track]) -> Option<i64> {
+    if tracks.iter().filter(|t| t.default).count() < 2 {
+        return None;
+    }
+    // forced among the Defaults first; failing that, any forced track of this kind
+    let mut forced: Vec<&Track> = tracks.iter().filter(|t| t.default && t.forced).collect();
+    if forced.is_empty() {
+        forced = tracks.iter().filter(|t| t.forced).collect();
+    }
+    let english = |t: &Track| {
+        let l = t.lang.to_lowercase();
+        matches!(l.as_str(), "en" | "eng" | "english") || l.starts_with("en-")
+    };
+    let pick = forced.iter().copied().find(|t| english(t)).or(forced.first().copied()).map(|t| t.id);
+    log::debug!("multiple default tracks: {} forced candidate(s), picked {:?}", forced.len(), pick);
+    pick
+}
+
 fn is_fullscreen(ctx: &egui::Context) -> bool {
+    if cfg!(target_os = "macos") {
+        return ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+    }
     ctx.data(|d| d.get_temp::<Option<(egui::Rect, bool)>>(egui::Id::new("bl_fs")).map_or(false, |r| r.is_some()))
 }
 
 fn set_fullscreen(ctx: &egui::Context, on: bool) {
+    // macOS has real fullscreen (its own Space) and no exclusive-mode flicker, so use it as is
+    if cfg!(target_os = "macos") {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        return;
+    }
     let id = egui::Id::new("bl_fs");
     let saved: Option<(egui::Rect, bool)> = ctx.data(|d| d.get_temp::<Option<(egui::Rect, bool)>>(id)).flatten();
     if on && saved.is_none() {
@@ -1925,7 +2272,7 @@ const CJK_Y_OFFSET: f32 = 0.18;
 
 /// Borrow system's CJK fonts since egui doesn't have built-in JP/KR/CN glyphs
 fn install_cjk_fonts(ctx: &egui::Context) {
-    const CANDIDATES: [&str; 14] = [
+    const CANDIDATES: [&str; 16] = [
         r"C:\Windows\Fonts\YuGothM.ttc",
         r"C:\Windows\Fonts\YuGothR.ttc",
         r"C:\Windows\Fonts\meiryo.ttc",
@@ -1933,7 +2280,9 @@ fn install_cjk_fonts(ctx: &egui::Context) {
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\malgun.ttf",
         r"C:\Windows\Fonts\simsun.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
         "/System/Library/Fonts/AppleSDGothicNeo.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
