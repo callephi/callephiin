@@ -590,3 +590,6 @@ zune-jpeg       0.5.15  caleb <etemesicaleb@gmail.com>  https://github.com/eteme
 zvariant        5.15.0  Zeeshan Ali Khan <zeeshanak@gnome.org>  https://github.com/z-galaxy/zbus/       MIT             D-Bus & GVariant encoding & decoding
 zvariant_derive 5.15.0  Zeeshan Ali Khan <zeeshanak@gnome.org>  https://github.com/z-galaxy/zbus/       MIT             D-Bus & GVariant encoding & decoding
 zvariant_utils  4.2.0   Zeeshan Ali Khan <zeeshanak@gnome.org>|turbocooler <turbocooler@cocaine.ninja>  https://github.com/z-galaxy/zbus/MIT              Various utilities used internally by the zvariant crate.
+
+egg.ogg courtesy of Deltarune Piano Collections Vol. 1, composed by Toby Fox and performed by Trevor Alan Gomes.
+egg.gif courtesy of Toby Fox's DELTARUNE.
